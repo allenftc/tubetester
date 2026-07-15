@@ -1,0 +1,12 @@
+{
+  "moonraker": {
+    "base_url": "http://192.168.8.225:7125",
+    "timeout_seconds": 5.0,
+    "api_key": null
+  },
+  "web": {
+    "host": "127.0.0.1",
+    "port": 8080,
+    "title": "Tube Tester Control"
+  }
+}

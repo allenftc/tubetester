@@ -1,0 +1,15 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "tube-tester"
+version = "0.1.0"
+description = "Test tube scanner robot scaffold for a Klipper gantry"
+requires-python = ">=3.11"
+
+[project.scripts]
+tube-tester = "controller.main:main"
+
+[tool.setuptools.packages.find]
+include = ["controller*"]
