@@ -10,11 +10,11 @@ class KlipperMotionClient:
     pickup_macro: str = "TUBE_PICKUP"
     release_macro: str = "TUBE_RELEASE"
     yaw_macro: str = "TUBE_SET_YAW"
-    safe_z_macro: str = "TUBE_SAFE_Z"
+    safe_z_macro: str = "TUBE_SAFE_Z" 
 
     def home_command(self) -> str:
         return "G28"
-
+ 
     def move_command(
         self,
         *,
