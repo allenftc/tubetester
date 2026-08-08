@@ -50,12 +50,17 @@
 uint16_t encoderValue = 0;
 float absolutePosition = 0.0f;
 float degreesPerTick = 360.0f / 65536.0f; // Assuming a 16-bit encoder
+
+float targetPosition = 67.41f; // Target position in degrees
+float kP = 0.015f; // Proportional gain for the control loop
+uint32_t ADCValue = 0;
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
 void SystemClock_Config(void);
 /* USER CODE BEGIN PFP */
 void setMotorPower(float power);
+float wrapAngle(float degrees);
 /* USER CODE END PFP */
 
 /* Private user code ---------------------------------------------------------*/
@@ -87,7 +92,25 @@ int main(void)
   SystemClock_Config();
 
   /* USER CODE BEGIN SysInit */
+  /* Force USB Re-Enumeration */
+  GPIO_InitTypeDef GPIO_InitStruct = {0};
 
+  // 1. Enable GPIOA Clock
+  __HAL_RCC_GPIOA_CLK_ENABLE();
+
+  // 2. Configure PA12 (USB D+) as Output Push-Pull
+  GPIO_InitStruct.Pin = GPIO_PIN_12;
+  GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
+  GPIO_InitStruct.Pull = GPIO_NOPULL;
+  GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
+  HAL_GPIO_Init(GPIOA, &GPIO_InitStruct);
+
+  // 3. Drive the line LOW to trick the PC into thinking the cable was unplugged
+  HAL_GPIO_WritePin(GPIOA, GPIO_PIN_12, GPIO_PIN_RESET);
+  HAL_Delay(50); // 50ms is plenty for the host PC to register the disconnect
+
+  // 4. De-initialize the GPIO so the native USB hardware can take it over
+  HAL_GPIO_DeInit(GPIOA, GPIO_PIN_12);
   /* USER CODE END SysInit */
 
   /* Initialize all configured peripherals */
@@ -97,19 +120,20 @@ int main(void)
   MX_ADC1_Init();
   MX_TIM1_Init();
   MX_USB_DEVICE_Init();
+  MX_TIM3_Init();
   /* USER CODE BEGIN 2 */
   HAL_TIM_PWM_Start(&htim1, TIM_CHANNEL_1); // Start PWM on TIM1 Channel 1
+  HAL_TIM_Base_Start_IT(&htim3); // Start TIM3 in interrupt mode for control loop
+  HAL_ADCEx_Calibration_Start(&hadc1); // Start ADC calibration
+  HAL_ADC_Start_DMA(&hadc1, (uint32_t*)&ADCValue, 1); // Start ADC in DMA mode
   /* USER CODE END 2 */
 
   /* Infinite loop */
   /* USER CODE BEGIN WHILE */
   while (1)
   {
-    printf("Hello STM32! Debug line %lu\r\n", HAL_GetTick());
-    setMotorPower(1.0f); // Set motor power to 50%
-    HAL_Delay(1000);
-    setMotorPower(-1.0f); // Set motor power to -50%
-    HAL_Delay(1000);
+    printf("ADC Value: %lu | Pos: %lu deg\r\n" , ADCValue, (uint32_t)absolutePosition); // Print ADC value and position in degrees
+    HAL_Delay(250); // Delay for 0.25 second
     /* USER CODE END WHILE */
 
     /* USER CODE BEGIN 3 */
@@ -195,6 +219,17 @@ int _write(int file, char *ptr, int len) {
 int _read(int file, char *ptr, int len) {
   // Implement reading from USB CDC if needed
   return 0;
+}
+
+void HAL_ADC_ConvCpltCallback(ADC_HandleTypeDef* hadc) {
+    absolutePosition = ((float)ADCValue - 1088.0f) * 360.0f / (3094.0f - 1088.0f);
+    setMotorPower(wrapAngle(targetPosition - absolutePosition) * kP);
+}
+
+float wrapAngle(float degrees) {
+	while (degrees > 180.0f) degrees -= 360.0f;
+  while (degrees < -180.0f) degrees += 360.0f;
+  return degrees;
 }
 /* USER CODE END 4 */
 
