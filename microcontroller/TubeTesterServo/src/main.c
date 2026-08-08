@@ -49,13 +49,16 @@
 /* USER CODE BEGIN PV */
 uint16_t encoderValue = 0;
 float absolutePosition = 0.0f;
+uint32_t adcAbsolutePosition = 0;
 float degreesPerTick = 360.0f / 65536.0f; // Assuming a 16-bit encoder
+float kP = 0.1f; // Proportional gain for the PID controller
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
 void SystemClock_Config(void);
 /* USER CODE BEGIN PFP */
 void setMotorPower(float power);
+float calculatePower(float targetPosition);
 /* USER CODE END PFP */
 
 /* Private user code ---------------------------------------------------------*/
@@ -99,17 +102,16 @@ int main(void)
   MX_USB_DEVICE_Init();
   /* USER CODE BEGIN 2 */
   HAL_TIM_PWM_Start(&htim1, TIM_CHANNEL_1); // Start PWM on TIM1 Channel 1
+  //HAL_ADC_Start_DMA(&hadc1, &adcAbsolutePosition, 1); // Start ADC in DMA mode
   /* USER CODE END 2 */
 
   /* Infinite loop */
   /* USER CODE BEGIN WHILE */
   while (1)
   {
-    printf("Hello STM32! Debug line %lu\r\n", HAL_GetTick());
-    setMotorPower(1.0f); // Set motor power to 50%
-    HAL_Delay(1000);
-    setMotorPower(-1.0f); // Set motor power to -50%
-    HAL_Delay(1000);
+    printf('Absolute Position: %.2f degrees\n', absolutePosition);
+    //float power = calculatePower(90.0f); // Set target position to 90 degrees
+    //setMotorPower(power);
     /* USER CODE END WHILE */
 
     /* USER CODE BEGIN 3 */
@@ -195,6 +197,45 @@ int _write(int file, char *ptr, int len) {
 int _read(int file, char *ptr, int len) {
   // Implement reading from USB CDC if needed
   return 0;
+}
+
+void HAL_ADC_ConvCpltCallback(ADC_HandleTypeDef* hadc) {
+    if (hadc->Instance == ADC1) {
+      //docs.sensorangerobotics.com: double angle = AngleUnit.normalizeDegrees((encoder.getVoltage()-0.043)/3.1*360 + offset);
+        float voltage = adcAbsolutePosition/4096.0f * 3.3f; // Assuming a 12-bit ADC and mapping to degrees
+        absolutePosition = (voltage - 0.043f) / 3.1f * 360.0f; // Map voltage to degrees
+    }
+}
+
+float calculatePower(float targetPosition) {
+
+    // Normalize target position to [-180, 180]
+    float normalizedTarget = fmodf(targetPosition + 180.0f, 360.0f);
+    if (normalizedTarget >= 180.0f) {
+        normalizedTarget -= 360.0f;
+    }
+
+    // Normalize absolute position to [-180, 180]
+    float normalizedAbsolute = fmodf(absolutePosition + 180.0f, 360.0f);
+    if (normalizedAbsolute >= 180.0f) {
+        normalizedAbsolute -= 360.0f;
+    }
+
+    // Calculate error with angle wrapping
+    float error = normalizedTarget - normalizedAbsolute;
+    if (error > 180.0f) {
+        error -= 360.0f;
+    } else if (error < -180.0f) {
+        error += 360.0f;
+    }
+    float power = kP * error;
+
+    // Clamp power to [-1.0, 1.0]
+    if (power > 1.0f) power = 1.0f;
+    if (power < -1.0f) power = -1.0f;
+
+    return power;
+
 }
 /* USER CODE END 4 */
 
