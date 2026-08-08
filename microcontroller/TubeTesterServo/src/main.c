@@ -47,13 +47,15 @@
 /* Private variables ---------------------------------------------------------*/
 
 /* USER CODE BEGIN PV */
-
+uint16_t encoderValue = 0;
+float absolutePosition = 0.0f;
+float degreesPerTick = 360.0f / 65536.0f; // Assuming a 16-bit encoder
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
 void SystemClock_Config(void);
 /* USER CODE BEGIN PFP */
-
+void setMotorPower(float power);
 /* USER CODE END PFP */
 
 /* Private user code ---------------------------------------------------------*/
@@ -96,13 +98,18 @@ int main(void)
   MX_TIM1_Init();
   MX_USB_DEVICE_Init();
   /* USER CODE BEGIN 2 */
-
+  HAL_TIM_PWM_Start(&htim1, TIM_CHANNEL_1); // Start PWM on TIM1 Channel 1
   /* USER CODE END 2 */
 
   /* Infinite loop */
   /* USER CODE BEGIN WHILE */
   while (1)
   {
+    printf("Hello STM32! Debug line %lu\r\n", HAL_GetTick());
+    setMotorPower(1.0f); // Set motor power to 50%
+    HAL_Delay(1000);
+    setMotorPower(-1.0f); // Set motor power to -50%
+    HAL_Delay(1000);
     /* USER CODE END WHILE */
 
     /* USER CODE BEGIN 3 */
@@ -158,7 +165,37 @@ void SystemClock_Config(void)
 }
 
 /* USER CODE BEGIN 4 */
+void setMotorPower(float power) {
+    if (power > 1.0f) power = 1.0f;
+    if (power < -1.0f) power = -1.0f;
 
+    if (power > 0.0f) {
+        HAL_GPIO_WritePin(GPIOB, GPIO_PIN_12, GPIO_PIN_RESET);
+        HAL_GPIO_WritePin(GPIOB, GPIO_PIN_13, GPIO_PIN_SET);
+    } 
+    else if (power < 0.0f) {
+        HAL_GPIO_WritePin(GPIOB, GPIO_PIN_12, GPIO_PIN_SET);
+        HAL_GPIO_WritePin(GPIOB, GPIO_PIN_13, GPIO_PIN_RESET);
+    } 
+    else {
+        HAL_GPIO_WritePin(GPIOB, GPIO_PIN_12, GPIO_PIN_RESET);
+        HAL_GPIO_WritePin(GPIOB, GPIO_PIN_13, GPIO_PIN_RESET);
+    }
+
+    uint32_t arr = __HAL_TIM_GET_AUTORELOAD(&htim1);
+    uint32_t pwm = (uint32_t)(fabsf(power) * (float)arr);
+    
+    __HAL_TIM_SET_COMPARE(&htim1, TIM_CHANNEL_1, pwm);
+}
+
+int _write(int file, char *ptr, int len) {
+  CDC_Transmit_FS((uint8_t*)ptr, len);
+  return len;
+}
+int _read(int file, char *ptr, int len) {
+  // Implement reading from USB CDC if needed
+  return 0;
+}
 /* USER CODE END 4 */
 
 /**
