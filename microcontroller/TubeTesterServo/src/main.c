@@ -29,7 +29,11 @@
 
 /* Private typedef -----------------------------------------------------------*/
 /* USER CODE BEGIN PTD */
-
+typedef enum MotorState {
+    IDLE,
+    OPENING,
+    TURNING
+} MotorState;
 /* USER CODE END PTD */
 
 /* Private define ------------------------------------------------------------*/
@@ -46,14 +50,18 @@
 
 /* USER CODE BEGIN PV */
 int16_t encoderValue = 0;
+int16_t ticksPerOpening = 1600;
 float absolutePosition = 0.0f;
-float degreesPerTick = 360.0f / 65536.0f; // Assuming a 16-bit encoder
+
 
 float targetPosition = 0.0f; // Target position in degrees
 float kP = 0.004f; // Proportional gain for the control loop
+float encoderKP = 0.0005f; // Proportional gain for the encoder feedback
 uint32_t cycleTime = 0;
 float dutyCycle = 0.0f;
 float offset = 35.0f; // Offset for the absolute position
+MotorState motorState = IDLE; // Current state of the motor
+
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
@@ -133,7 +141,7 @@ int main(void)
   /* USER CODE BEGIN WHILE */
   while (1)
   {
-    encoderValue = (int16_t)(TIM2->CNT); // Read the encoder value from TIM2 counter
+    
     printf("Absolute Position: %i degrees, Encoder Value: %i\n", (int)absolutePosition, encoderValue);
     HAL_Delay(100); // Delay for 0.1 second
     /* USER CODE END WHILE */
@@ -191,6 +199,7 @@ void SystemClock_Config(void)
 
 /* USER CODE BEGIN 4 */
 void setMotorPower(float power) {
+    power *= -1.0f; // Invert power to match motor direction
     if (power > 1.0f) power = 1.0f;
     if (power < -1.0f) power = -1.0f;
 
@@ -229,8 +238,31 @@ void HAL_TIM_IC_CaptureCallback(TIM_HandleTypeDef *htim) {
         cycleTime = HAL_TIM_ReadCapturedValue(htim, TIM_CHANNEL_2);
         dutyCycle = (float)HAL_TIM_ReadCapturedValue(htim, TIM_CHANNEL_1) / cycleTime;
         absolutePosition = wrapAngle(dutyCycle * 360.0f + offset); // Convert duty cycle to degrees
-        
-        setMotorPower(wrapAngle(targetPosition - absolutePosition) * -kP);
+        encoderValue = (int16_t)(TIM2->CNT); // Read the encoder value from TIM2 counter
+
+        switch (motorState) {
+            case IDLE:
+                // Do nothing
+                break;
+            case OPENING:
+                if (encoderValue > ticksPerOpening - 10) { // If close to target
+                    setMotorPower(0.0f); // Stop the motor
+                    TIM2->CNT = 0; // Reset encoder count
+                    motorState = IDLE; // Transition to idle state
+                } else {
+                    setMotorPower(encoderKP * (ticksPerOpening - encoderValue)); // Use encoder feedback to control motor
+                }
+                break;
+            case TURNING:
+                // Control the motor to reach the target position
+                if (fabsf(wrapAngle(targetPosition - absolutePosition)) < 5.0f) {
+                    setMotorPower(0.0f); // Stop the motor when close to target
+                    motorState = IDLE; // Transition back to idle state
+                } else {
+                    setMotorPower(wrapAngle(targetPosition - absolutePosition) * kP);
+                }
+                break;
+        }
     }
 }
 
