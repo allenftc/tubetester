@@ -18,8 +18,6 @@
 /* USER CODE END Header */
 /* Includes ------------------------------------------------------------------*/
 #include "main.h"
-#include "adc.h"
-#include "dma.h"
 #include "tim.h"
 #include "usb_device.h"
 #include "gpio.h"
@@ -51,9 +49,11 @@ uint16_t encoderValue = 0;
 float absolutePosition = 0.0f;
 float degreesPerTick = 360.0f / 65536.0f; // Assuming a 16-bit encoder
 
-float targetPosition = 67.41f; // Target position in degrees
-float kP = 0.015f; // Proportional gain for the control loop
-uint32_t ADCValue = 0;
+float targetPosition = 0.0f; // Target position in degrees
+float kP = 0.004f; // Proportional gain for the control loop
+uint32_t cycleTime = 0;
+float dutyCycle = 0.0f;
+float offset = 35.0f; // Offset for the absolute position
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
@@ -115,25 +115,25 @@ int main(void)
 
   /* Initialize all configured peripherals */
   MX_GPIO_Init();
-  MX_DMA_Init();
   MX_TIM2_Init();
-  MX_ADC1_Init();
   MX_TIM1_Init();
   MX_USB_DEVICE_Init();
   MX_TIM3_Init();
   /* USER CODE BEGIN 2 */
   HAL_TIM_PWM_Start(&htim1, TIM_CHANNEL_1); // Start PWM on TIM1 Channel 1
   HAL_TIM_Base_Start_IT(&htim3); // Start TIM3 in interrupt mode for control loop
-  HAL_ADCEx_Calibration_Start(&hadc1); // Start ADC calibration
-  HAL_ADC_Start_DMA(&hadc1, (uint32_t*)&ADCValue, 1); // Start ADC in DMA mode
+  //HAL_ADCEx_Calibration_Start(&hadc1); // Start ADC calibration
+  //HAL_ADC_Start_DMA(&hadc1, (uint32_t*)&ADCValue, 1); // Start ADC in DMA mode
+  HAL_TIM_IC_Start_IT(&htim3, TIM_CHANNEL_2); // Start Input Capture on TIM3 Channel 1
+  HAL_TIM_IC_Start(&htim3, TIM_CHANNEL_1); // Start Input Capture
   /* USER CODE END 2 */
 
   /* Infinite loop */
   /* USER CODE BEGIN WHILE */
   while (1)
   {
-    printf("ADC Value: %lu | Pos: %lu deg\r\n" , ADCValue, (uint32_t)absolutePosition); // Print ADC value and position in degrees
-    HAL_Delay(250); // Delay for 0.25 second
+    printf("Absolute Position: %i degrees\n", (int)absolutePosition);
+    HAL_Delay(100); // Delay for 0.1 second
     /* USER CODE END WHILE */
 
     /* USER CODE BEGIN 3 */
@@ -179,8 +179,7 @@ void SystemClock_Config(void)
   {
     Error_Handler();
   }
-  PeriphClkInit.PeriphClockSelection = RCC_PERIPHCLK_ADC|RCC_PERIPHCLK_USB;
-  PeriphClkInit.AdcClockSelection = RCC_ADCPCLK2_DIV6;
+  PeriphClkInit.PeriphClockSelection = RCC_PERIPHCLK_USB;
   PeriphClkInit.UsbClockSelection = RCC_USBCLKSOURCE_PLL_DIV1_5;
   if (HAL_RCCEx_PeriphCLKConfig(&PeriphClkInit) != HAL_OK)
   {
@@ -221,9 +220,16 @@ int _read(int file, char *ptr, int len) {
   return 0;
 }
 
-void HAL_ADC_ConvCpltCallback(ADC_HandleTypeDef* hadc) {
-    absolutePosition = ((float)ADCValue - 1088.0f) * 360.0f / (3094.0f - 1088.0f);
-    setMotorPower(wrapAngle(targetPosition - absolutePosition) * kP);
+
+
+void HAL_TIM_IC_CaptureCallback(TIM_HandleTypeDef *htim) {
+    if (htim->Instance == TIM3) {
+        cycleTime = HAL_TIM_ReadCapturedValue(htim, TIM_CHANNEL_2);
+        dutyCycle = (float)HAL_TIM_ReadCapturedValue(htim, TIM_CHANNEL_1) / cycleTime;
+        absolutePosition = wrapAngle(dutyCycle * 360.0f + offset); // Convert duty cycle to degrees
+        
+        setMotorPower(wrapAngle(targetPosition - absolutePosition) * -kP);
+    }
 }
 
 float wrapAngle(float degrees) {
