@@ -45,7 +45,7 @@
 /* Private variables ---------------------------------------------------------*/
 
 /* USER CODE BEGIN PV */
-uint16_t encoderValue = 0;
+int16_t encoderValue = 0;
 float absolutePosition = 0.0f;
 float degreesPerTick = 360.0f / 65536.0f; // Assuming a 16-bit encoder
 
@@ -126,13 +126,15 @@ int main(void)
   //HAL_ADC_Start_DMA(&hadc1, (uint32_t*)&ADCValue, 1); // Start ADC in DMA mode
   HAL_TIM_IC_Start_IT(&htim3, TIM_CHANNEL_2); // Start Input Capture on TIM3 Channel 1
   HAL_TIM_IC_Start(&htim3, TIM_CHANNEL_1); // Start Input Capture
+  HAL_TIM_Encoder_Start(&htim2, TIM_CHANNEL_ALL); // Start Encoder Interface on TIM2
   /* USER CODE END 2 */
 
   /* Infinite loop */
   /* USER CODE BEGIN WHILE */
   while (1)
   {
-    printf("Absolute Position: %i degrees\n", (int)absolutePosition);
+    encoderValue = (int16_t)(TIM2->CNT); // Read the encoder value from TIM2 counter
+    printf("Absolute Position: %i degrees, Encoder Value: %i\n", (int)absolutePosition, encoderValue);
     HAL_Delay(100); // Delay for 0.1 second
     /* USER CODE END WHILE */
 
