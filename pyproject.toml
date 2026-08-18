@@ -7,9 +7,13 @@ name = "tube-tester"
 version = "0.1.0"
 description = "Test tube scanner robot scaffold for a Klipper gantry"
 requires-python = ">=3.11"
+dependencies = ["aiohttp>=3.9,<4"]
 
 [project.scripts]
 tube-tester = "controller.main:main"
 
 [tool.setuptools.packages.find]
 include = ["controller*"]
+
+[tool.setuptools.package-data]
+"controller.web" = ["templates/*.html", "static/*.css", "static/*.js"]

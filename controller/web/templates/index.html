@@ -1,0 +1,122 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="dark light">
+  <title>Tube Tester Control</title>
+  <link rel="stylesheet" href="/static/app.css">
+  <script src="/static/app.js" defer></script>
+</head>
+<body>
+  <div id="stale-banner" class="stale-banner" role="status" hidden>Live connection interrupted. Reconnecting…</div>
+  <main class="shell">
+    <header class="control-card card" aria-labelledby="page-title">
+      <div class="identity-row">
+        <div>
+          <p class="eyebrow">AUTOMATED RACK SCANNER</p>
+          <h1 id="page-title">Tube Tester Control</h1>
+        </div>
+        <div class="status-strip" aria-label="System status">
+          <span id="klipper-chip" class="chip neutral">● Klipper Offline</span>
+          <span id="controller-chip" class="chip neutral">● Controller Idle</span>
+          <span id="position-chip" class="chip neutral">Position Unknown</span>
+        </div>
+      </div>
+      <div class="controls" aria-label="Machine and workflow controls">
+        <div class="control-item">
+          <button id="home-button" title="Home all Klipper axes before scanning." disabled>Home Machine</button>
+          <small>Home all axes</small>
+        </div>
+        <div class="control-item">
+          <button id="preview-button" class="secondary" title="Validate the rack plan without moving hardware." disabled>Preview Run</button>
+          <small>Validate without motion</small>
+        </div>
+        <div class="control-item">
+          <button id="start-button" class="primary" title="Scan every pending tube in rack order." disabled>Start Scan</button>
+          <small>Scan pending tubes</small>
+        </div>
+        <div class="control-item">
+          <button id="pause-button" class="secondary" title="Pause after the active Moonraker command finishes." disabled>Pause</button>
+          <small id="pause-description">Hold safely</small>
+        </div>
+        <div class="control-item">
+          <button id="stop-button" class="danger" title="Stop after the active command; this is not an emergency stop." disabled>Stop</button>
+          <small>End cooperatively</small>
+        </div>
+      </div>
+      <div id="readiness" class="readiness" role="status">Connecting to controller…</div>
+    </header>
+
+    <section class="workflow-card card" aria-labelledby="workflow-title">
+      <div class="section-heading">
+        <div><p class="eyebrow">WORKFLOW</p><h2 id="workflow-title">Rack scan</h2></div>
+        <div class="progress-numbers"><strong id="tube-count">0 / 72</strong><span id="percent">0%</span></div>
+      </div>
+      <ol id="phase-stepper" class="stepper" aria-label="Current tube phases">
+        <li data-phase="home"><span>1</span>Home</li>
+        <li data-phase="approach"><span>2</span>Approach</li>
+        <li data-phase="pickup"><span>3</span>Pickup</li>
+        <li data-phase="scan"><span>4</span>Scan</li>
+        <li data-phase="release"><span>5</span>Release</li>
+      </ol>
+      <div class="summary-row">
+        <div>
+          <p id="current-description" class="current-description">Waiting for a scan.</p>
+          <p id="step-count" class="muted">0 of 0 steps</p>
+        </div>
+        <div class="summary-chips">
+          <span id="workflow-chip" class="chip neutral">IDLE</span>
+          <span id="qr-chip" class="chip neutral">QR UNAVAILABLE</span>
+          <span id="coordinate-chip" class="chip neutral">NO TUBE</span>
+        </div>
+      </div>
+      <div class="progress-track" role="progressbar" aria-label="Tube scan progress" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0"><span id="progress-fill"></span></div>
+      <div id="preview-result" class="preview-result" hidden></div>
+
+      <div class="rack-heading">
+        <h3 id="rack-title">Rack 6 × 12</h3>
+        <div class="legend" aria-label="Tube status legend">
+          <span>○ Pending</span><span>◉ Active</span><span>✓ Decoded</span><span>— No decode</span><span>! Failed</span>
+        </div>
+      </div>
+      <div class="rack-scroll" tabindex="0" aria-label="Scrollable rack grid">
+        <div id="rack-grid" class="rack-grid" role="grid" aria-labelledby="rack-title"></div>
+      </div>
+      <div id="tube-details" class="tube-details" aria-live="polite">Select a tube to inspect its calibrated position and result.</div>
+    </section>
+
+    <section id="console-card" class="console-card card" aria-labelledby="console-title">
+      <div class="console-header">
+        <div><p class="eyebrow">KLIPPER</p><h2 id="console-title">Console</h2></div>
+        <div class="console-tools">
+          <button id="clear-console" class="icon-button" title="Clear console messages in this browser." aria-label="Clear console">⌫</button>
+          <button id="help-console" class="icon-button" title="Show console syntax and safety guidance." aria-label="Console help" aria-expanded="false">?</button>
+          <button id="settings-console" class="icon-button" title="Filter console messages." aria-label="Console settings" aria-expanded="false">⚙</button>
+          <button id="collapse-console" class="icon-button" title="Collapse or expand the console." aria-label="Collapse console" aria-expanded="true">⌃</button>
+        </div>
+      </div>
+      <div id="help-panel" class="popover" hidden>
+        Enter one line of G-code and press Enter to send it. Arbitrary G-code can move hardware. Errors are red and warnings are amber.
+      </div>
+      <fieldset id="settings-panel" class="popover filter-panel" hidden>
+        <legend>Visible console events</legend>
+        <div id="level-filters"><strong>Levels</strong></div>
+        <div id="source-filters"><strong>Sources</strong></div>
+        <button id="show-history" type="button" class="text-button">Show retained history</button>
+      </fieldset>
+      <div id="console-body">
+        <form id="gcode-form" class="composer">
+          <label class="sr-only" for="gcode-input">Send G-code to Klipper</label>
+          <input id="gcode-input" type="text" maxlength="1000" autocomplete="off" placeholder="Send code…" disabled>
+          <button id="send-button" type="submit" class="primary" disabled>Send</button>
+        </form>
+        <div id="console-log" class="console-log" role="log" aria-live="off" aria-label="Controller console events">
+          <div id="console-empty" class="console-empty">No console messages yet.</div>
+        </div>
+      </div>
+    </section>
+    <div id="announcer" class="sr-only" aria-live="polite"></div>
+  </main>
+</body>
+</html>
