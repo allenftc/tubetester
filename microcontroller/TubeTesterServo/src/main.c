@@ -55,7 +55,7 @@ float absolutePosition = 0.0f;
 
 
 float targetPosition = 0.0f; // Target position in degrees
-float kP = 0.004f; // Proportional gain for the control loop
+float kP = 0.001f; // Proportional gain for the control loop
 float encoderKP = 0.0005f; // Proportional gain for the encoder feedback
 uint32_t cycleTime = 0;
 float dutyCycle = 0.0f;
@@ -142,7 +142,7 @@ int main(void)
   while (1)
   {
     
-    printf("Absolute Position: %i degrees, Encoder Value: %i\n", (int)absolutePosition, encoderValue);
+    printf("Absolute Position: %i degrees, Encoder Value: %i, Target: %i degrees\n", (int)absolutePosition, encoderValue, (int)targetPosition);
     HAL_Delay(100); // Delay for 0.1 second
     /* USER CODE END WHILE */
 
@@ -247,7 +247,7 @@ void HAL_TIM_IC_CaptureCallback(TIM_HandleTypeDef *htim) {
             case OPENING:
                 if (encoderValue > ticksPerOpening - 10) { // If close to target
                     setMotorPower(0.0f); // Stop the motor
-                    TIM2->CNT = 0; // Reset encoder count
+                    
                     motorState = IDLE; // Transition to idle state
                 } else {
                     setMotorPower(encoderKP * (ticksPerOpening - encoderValue)); // Use encoder feedback to control motor
@@ -259,7 +259,15 @@ void HAL_TIM_IC_CaptureCallback(TIM_HandleTypeDef *htim) {
                     setMotorPower(0.0f); // Stop the motor when close to target
                     motorState = IDLE; // Transition back to idle state
                 } else {
-                    setMotorPower(wrapAngle(targetPosition - absolutePosition) * kP);
+                    float error = targetPosition - absolutePosition;
+                    if (error > 0) {
+                      error -= 360.0f; // Wrap error to negative range
+                    }
+                    printf("Error: %i degrees\n", (int)error);
+                    float power = error * kP;
+                    if (power > -0.1) power = -0.1; // Minimum power to overcome static friction
+                    if (power < -0.5) power = -0.5; // Maximum
+                    setMotorPower(power); //Can only go one way
                 }
                 break;
         }
@@ -270,6 +278,34 @@ float wrapAngle(float degrees) {
 	while (degrees > 180.0f) degrees -= 360.0f;
   while (degrees < -180.0f) degrees += 360.0f;
   return degrees;
+}
+
+
+void USB_CDC_RxHandler(uint8_t* Buf, uint32_t Len)
+{
+	char cmd = Buf[0];
+  int16_t value = atoi((char*)&Buf[1]); // Convert the rest of the buffer to an integer
+  switch (cmd) {
+    case 'O': // Open command
+        motorState = OPENING;
+        TIM2->CNT = 0; // Reset encoder count
+        printf("Opening command received. Encoder target: %i ticks\n", ticksPerOpening);
+        break;
+    case 'T': // Turn command
+        targetPosition = (float)value; // Set target position in degrees
+        motorState = TURNING;
+        printf("Turn command received. Target position: %.2f degrees\n", targetPosition);
+        break;
+    case 'S': // Stop command
+        setMotorPower(0.0f);
+        motorState = IDLE; // Stop the motor
+        printf("Stop command received. Motor stopped.\n");
+        break;
+    default:
+        // Unknown command, ignore
+        printf("What are you talking about like %c ahh\n", cmd);
+        break;
+  }
 }
 /* USER CODE END 4 */
 

@@ -1,6 +1,8 @@
 {
-  "origin_mm": {"x": 0.0, "y": 0.0, "z": 0.0},
-  "tube_pitch_mm": {"x": 9.0, "y": 9.0},
+  "origin_mm": {"x": 0, "y": 0, "z": 0.0},
+  "tube_pitch_mm": {"x": 20, "y": 20},
   "pickup_offset_mm": {"x": 0.0, "y": 0.0, "z": 4.0},
-  "safe_z_mm": 30.0
+  "safe_z_mm": 100.0,
+  "columns": 12,
+  "rows": 6
 }

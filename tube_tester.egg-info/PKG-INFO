@@ -1,0 +1,6 @@
+Metadata-Version: 2.4
+Name: tube-tester
+Version: 0.1.0
+Summary: Test tube scanner robot scaffold for a Klipper gantry
+Requires-Python: >=3.11
+Requires-Dist: pyserial>=3.0

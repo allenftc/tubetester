@@ -30,6 +30,15 @@ class RackSettings:
     tube_pitch_mm: Point2D
     pickup_offset_mm: Point3D
     safe_z_mm: float
+    columns: int = 1
+    rows: int = 1
+
+    def tube_position(self, row: int, column: int) -> Point3D:
+        return Point3D(
+            x=self.origin_mm.x + self.pickup_offset_mm.x + self.tube_pitch_mm.x * column,
+            y=self.origin_mm.y + self.pickup_offset_mm.y + self.tube_pitch_mm.y * row,
+            z=self.origin_mm.z + self.pickup_offset_mm.z,
+        )
 
 
 @dataclass(frozen=True)
@@ -101,6 +110,8 @@ def load_settings(config_dir: Path) -> ControllerSettings:
         tube_pitch_mm=_point2d(rack_data["tube_pitch_mm"]),
         pickup_offset_mm=_point3d(rack_data["pickup_offset_mm"]),
         safe_z_mm=float(rack_data["safe_z_mm"]),
+        columns=int(rack_data.get("columns", 1)),
+        rows=int(rack_data.get("rows", 1)),
     )
     yaw = YawSettings(
         start_deg=float(yaw_data["start_deg"]),

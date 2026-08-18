@@ -19,6 +19,11 @@ class ScanStep:
     name: str
     description: str
     yaw_angle_deg: float | None = None
+    x_mm: float | None = None
+    y_mm: float | None = None
+    z_mm: float | None = None
+    row: int | None = None
+    column: int | None = None
 
 
 @dataclass(frozen=True)
@@ -31,22 +36,61 @@ class TubeScanWorkflow:
         self.settings = settings
 
     def build_plan(self) -> ScanPlan:
-        steps = [
-            ScanStep("home", "Home all axes"),
-            ScanStep("approach", "Move above the target tube"),
-            ScanStep("pickup", "Lower, grip, and lift the tube"),
-        ]
+        steps: list[ScanStep] = [ScanStep("home", "Home all axes")]
 
-        for yaw_angle in self.settings.yaw.sweep_angles():
-            steps.append(
-                ScanStep(
-                    name=f"scan_yaw_{yaw_angle:g}",
-                    description=f"Rotate tube to {yaw_angle:.1f} degrees for QR scan",
-                    yaw_angle_deg=yaw_angle,
+        for row in range(1, self.settings.rack.rows + 1):
+            for column in range(1, self.settings.rack.columns + 1):
+                target = self.settings.rack.tube_position(row - 1, column - 1)
+
+                steps.append(
+                    ScanStep(
+                        name=f"approach_r{row}_c{column}",
+                        description=f"Move above tube at row {row}, column {column}",
+                        x_mm=target.x,
+                        y_mm=target.y,
+                        z_mm=self.settings.rack.safe_z_mm,
+                        row=row,
+                        column=column,
+                    )
                 )
-            )
+                steps.append(
+                    ScanStep(
+                        name=f"pickup_r{row}_c{column}",
+                        description=f"Lower, grip, and lift tube at row {row}, column {column}",
+                        x_mm=target.x,
+                        y_mm=target.y,
+                        z_mm=target.z,
+                        row=row,
+                        column=column,
+                    )
+                )
 
-        steps.append(ScanStep("release", "Release the tube and return to safe position"))
+                for yaw_angle in self.settings.yaw.sweep_angles():
+                    steps.append(
+                        ScanStep(
+                            name=f"scan_r{row}_c{column}_yaw_{yaw_angle:g}",
+                            description=f"Rotate tube at row {row}, column {column} to {yaw_angle:.1f} degrees for QR scan",
+                            yaw_angle_deg=yaw_angle,
+                            x_mm=target.x,
+                            y_mm=target.y,
+                            z_mm=target.z,
+                            row=row,
+                            column=column,
+                        )
+                    )
+
+                steps.append(
+                    ScanStep(
+                        name=f"release_r{row}_c{column}",
+                        description=f"Release tube at row {row}, column {column} and return to safe position",
+                        x_mm=target.x,
+                        y_mm=target.y,
+                        z_mm=self.settings.rack.safe_z_mm,
+                        row=row,
+                        column=column,
+                    )
+                )
+
         return ScanPlan(steps=tuple(steps))
 
     def describe(self) -> list[str]:

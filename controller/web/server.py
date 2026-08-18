@@ -5,7 +5,8 @@ from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 from controller.config.settings import ControllerSettings
-from controller.network.moonraker import MoonrakerClient
+from controller.motion.klipper_client import KlipperMotionClient
+from controller.network.moonraker import MoonrakerClient, MoonrakerResponse
 from controller.workflow.state_machine import TubeScanWorkflow
 
 
@@ -37,6 +38,9 @@ def create_control_server(settings: ControllerSettings) -> ThreadingHTTPServer:
                 return
             if self.path == "/api/dry-run":
                 self._send_json({"workflow": [step.__dict__ for step in workflow.build_plan().steps]})
+                return
+            if self.path == "/api/run-workflow":
+                self._send_json(_execute_workflow(settings, workflow, moonraker_client))
                 return
             if self.path == "/api/gcode":
                 body = self._read_json_body()
@@ -83,6 +87,64 @@ def serve_control_server(settings: ControllerSettings) -> None:
     server.serve_forever()
 
 
+def _execute_workflow(settings: ControllerSettings, workflow: TubeScanWorkflow, moonraker_client: MoonrakerClient) -> dict:
+    motion = KlipperMotionClient()
+    plan = workflow.build_plan()
+    results: list[dict[str, object]] = []
+
+    safe_z = settings.rack.safe_z_mm
+
+    for step in plan.steps:
+        if step.name == "home":
+            command = motion.home_command()
+            response = moonraker_client.home()
+        elif step.name.startswith("approach_r") and step.x_mm is not None and step.y_mm is not None and step.z_mm is not None:
+            command = (
+                motion.move_command(z=safe_z, feedrate=10000)
+                + "\n"
+                + motion.move_command(x=step.x_mm, y=step.y_mm, feedrate=10000)
+            )
+            response = moonraker_client.send_gcode(command)
+        elif step.name.startswith("pickup_r") and step.z_mm is not None:
+            command = (
+                motion.move_command(z=step.z_mm, feedrate=10000)
+                + "\n"
+                + motion.pickup_command()
+            )
+            response = moonraker_client.send_gcode(command)
+        elif step.name.startswith("scan_r") and step.yaw_angle_deg is not None:
+            command = motion.set_yaw_command(step.yaw_angle_deg)
+            response = moonraker_client.send_gcode(command)
+        elif step.name.startswith("release_r"):
+            command = (
+                motion.move_command(z=safe_z, feedrate=10000)
+                + "\n"
+                + motion.release_command()
+            )
+            response = moonraker_client.send_gcode(command)
+        else:
+            command = ""
+            response = MoonrakerResponse(
+                ok=False,
+                status_code=0,
+                payload=None,
+                error_message=f"Unknown workflow step: {step.name}",
+            )
+
+        results.append(
+            {
+                "step": step.__dict__,
+                "command": command,
+                "response": response.__dict__,
+            }
+        )
+
+        if not response.ok:
+            break
+
+    return {"results": results}
+
+
 def _render_index(settings: ControllerSettings, workflow: TubeScanWorkflow) -> str:
     workflow_preview = "\n".join(f"<li>{step.name}: {step.description}</li>" for step in workflow.build_plan().steps)
     return f"""<!doctype html>
@@ -111,6 +173,7 @@ def _render_index(settings: ControllerSettings, workflow: TubeScanWorkflow) -> s
       <h2>Control</h2>
       <button onclick=\"post('/api/home')\">Home</button>
       <button onclick=\"post('/api/dry-run')\">Dry Run</button>
+      <button onclick=\"post('/api/run-workflow')\">Run Workflow</button>
       <button onclick=\"refreshStatus()\">Refresh Status</button>
       <label for=\"gcode\">Raw G-code</label>
       <input id=\"gcode\" type=\"text\" placeholder=\"M105\" />
