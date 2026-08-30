@@ -20,7 +20,7 @@ class LayoutScaffoldTests(unittest.TestCase):
         self.assertEqual(plan.steps[-1].name, "release")
         self.assertTrue(any(step.yaw_angle_deg is not None for step in plan.steps))
         self.assertEqual(settings.network.web.port, 8080)
-        self.assertEqual(settings.network.moonraker.base_url, "http://127.0.0.1:7125")
+        self.assertEqual(settings.network.moonraker.base_url, "http://192.168.8.225:7125")
 
 
 if __name__ == "__main__":
