@@ -56,7 +56,7 @@ float totalEncoderValue = 0;
 //int16_t ticksPerOpening = 1400;
 //int16_t ticksPerClosing = 500;
 float absolutePosition = 0.0f;
-float degreesPerTick = 360.0f / 5835.0f;
+float degreesPerTick = 360.0f / 5820.0f;
 
 float openPos = 75.0f;
 float closePos = 100.0f;
