@@ -24,8 +24,7 @@
 
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
-#include <math.h>
-#include "usbd_cdc_if.h"
+
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -33,7 +32,9 @@
 typedef enum MotorState {
     IDLE,
     OPENING,
-    TURNING
+    TURNING,
+    CLOSING,
+    HOMING
 } MotorState;
 /* USER CODE END PTD */
 
@@ -51,8 +52,14 @@ typedef enum MotorState {
 
 /* USER CODE BEGIN PV */
 int16_t encoderValue = 0;
-int16_t ticksPerOpening = 1600;
+float totalEncoderValue = 0;
+//int16_t ticksPerOpening = 1400;
+//int16_t ticksPerClosing = 500;
 float absolutePosition = 0.0f;
+float degreesPerTick = 360.0f / 5835.0f;
+
+float openPos = 75.0f;
+float closePos = 100.0f;
 
 
 float targetPosition = 0.0f; // Target position in degrees
@@ -61,32 +68,10 @@ float encoderKP = 0.0005f; // Proportional gain for the encoder feedback
 uint32_t cycleTime = 0;
 float dutyCycle = 0.0f;
 float offset = 35.0f; // Offset for the absolute position
-float lastPos = 0.0f; // Last position for calculating speed
-float speed = 0.0f; // Filtered speed in degrees per second
+int16_t lastPos = 0; // Last position for calculating speed
+int16_t speed = 0; // Speed in degrees per second
 MotorState motorState = IDLE; // Current state of the motor
-
-/*
- * TURNING profile calibration.  The mechanism only travels in the negative
- * motor-power direction, so it must begin reducing power before the target
- * instead of correcting an overshoot by reversing.
- *
- * Set TURN_FULL_SPEED_COAST_DEGREES to the measured coast distance at
- * TURN_REFERENCE_SPEED_DEG_PER_SEC.  The profile scales that distance using
- * the measured speed and ramps power down over TURN_POWER_RAMP_DEGREES.
- */
-#define TURN_MAX_POWER                 0.125f
-#define TURN_MIN_POWER                 0.030f
-#define TURN_STOP_TOLERANCE_DEGREES    2.0f
-#define TURN_FULL_SPEED_COAST_DEGREES 60.0f
-#define TURN_MIN_COAST_DEGREES         4.0f
-#define TURN_REFERENCE_SPEED_DEG_PER_SEC 180.0f
-#define TURN_POWER_RAMP_DEGREES       30.0f
-#define TURN_POWER_SLEW_PER_UPDATE    0.008f
-#define POSITION_UPDATE_PERIOD_SEC     0.010f
-
-float turnCommandPower = 0.0f;
-float turnRemainingDegrees = 0.0f;
-float turnCoastDistanceDegrees = 0.0f;
+uint8_t accelerationCounter = 0;
 
 /* USER CODE END PV */
 
@@ -95,8 +80,7 @@ void SystemClock_Config(void);
 /* USER CODE BEGIN PFP */
 void setMotorPower(float power);
 float wrapAngle(float degrees);
-float forwardAngle(float degrees);
-void updateTurnProfile(void);
+float round(float value, float multiple);
 /* USER CODE END PFP */
 
 /* Private user code ---------------------------------------------------------*/
@@ -143,7 +127,7 @@ int main(void)
 
   // 3. Drive the line LOW to trick the PC into thinking the cable was unplugged
   HAL_GPIO_WritePin(GPIOA, GPIO_PIN_12, GPIO_PIN_RESET);
-  HAL_Delay(50); // 50ms is plenty for the host PC to register the disconnect
+  HAL_Delay(50); // 50ms is plenty for the host PC to register the disconnectP
 
   // 4. De-initialize the GPIO so the native USB hardware can take it over
   HAL_GPIO_DeInit(GPIOA, GPIO_PIN_12);
@@ -170,7 +154,7 @@ int main(void)
   while (1)
   {
     
-    printf("Absolute Position: %i degrees, Encoder Value: %i, Target: %i degrees, Speed: %i deg/s\n", (int)absolutePosition, encoderValue, (int)targetPosition, (int) speed);
+    printf("Absolute Position: %i degrees, Encoder Value: %i, Target: %i degrees, Speed: %i deg/s\n", (int)absolutePosition, (int)(totalEncoderValue), (int)targetPosition, (int) speed);
     HAL_Delay(10); // Delay for 0.1 second
     /* USER CODE END WHILE */
 
@@ -264,40 +248,73 @@ int _read(int file, char *ptr, int len) {
 void HAL_TIM_IC_CaptureCallback(TIM_HandleTypeDef *htim) {
     if (htim->Instance == TIM3) {
         cycleTime = HAL_TIM_ReadCapturedValue(htim, TIM_CHANNEL_2);
-        if (cycleTime == 0U) {
-            return;
-        }
-
         dutyCycle = (float)HAL_TIM_ReadCapturedValue(htim, TIM_CHANNEL_1) / cycleTime;
         absolutePosition = wrapAngle(dutyCycle * 360.0f + offset); // Convert duty cycle to degrees
 
-        // Use the shortest angular delta so crossing -180/180 does not look like a 360 degree jump.
-        float tempSpeed = fabsf(wrapAngle(absolutePosition - lastPos)) / POSITION_UPDATE_PERIOD_SEC;
-        speed += 0.2f * (tempSpeed - speed); // Light filtering prevents profile jitter.
         encoderValue = (int16_t)(TIM2->CNT); // Read the encoder value from TIM2 counter
+        speed = (encoderValue); // Calculate speed in degrees per second
+        totalEncoderValue += speed * degreesPerTick; // Update total encoder value
+        totalEncoderValue = wrapAngle(totalEncoderValue); // Wrap total encoder value to -180 to 180 degrees
 
         switch (motorState) {
             case IDLE:
-                if (speed < 20.0f) { // If speed is low, stop the motor
-                    setMotorPower(0.0f);
-                }
                 setMotorPower(0.0f); // Ensure motor is stopped
-                // Do nothing
                 break;
             case OPENING:
-                if (encoderValue > ticksPerOpening - 10) { // If close to target
+                if (fabsf(wrapAngle(totalEncoderValue - targetPosition)) < 5.0f) { // If close to target
                     setMotorPower(0.0f); // Stop the motor
                     
                     motorState = IDLE; // Transition to idle state
-                } else {
-                    setMotorPower(encoderKP * (ticksPerOpening - encoderValue)); // Use encoder feedback to control motor
+                } else if (fabsf(speed) < 1.0f) {
+                    setMotorPower(1.0f); //Can only go one way
+                }
+                else {
+                  setMotorPower(0.8);
                 }
                 break;
+            case CLOSING:
+                if (fabsf(wrapAngle(totalEncoderValue - targetPosition)) < 5.0f) { // If close to target
+                    setMotorPower(0.0f); // Stop the motor
+                    
+                    motorState = IDLE; // Transition to idle state
+                } else if (fabsf(speed) < 1.0f) {
+                    setMotorPower(1.0f); //Can only go one way
+                }
+                else {
+                  setMotorPower(0.8);
+                }
+                break;            
             case TURNING:
-                updateTurnProfile();
+                // Control the motor to reach the target position
+                if (fabsf(wrapAngle(targetPosition - absolutePosition)) < 5.0f) {
+                    //setMotorPower(1.0f); // Stop the motor when close to target
+                    setMotorPower(0.0f); // Stop the motor when close to target
+                    motorState = IDLE; // Transition back to idle state
+                } else if (fabsf(speed) < 1.0f) {
+                    setMotorPower(-0.6); //Can only go one way
+                }
+                else {
+                  setMotorPower(-0.15);
+                }
                 break;
+            case HOMING:
+                if (fabsf(speed) < 1.0f && accelerationCounter > 50) { // If speed is low and enough time has passed
+                    setMotorPower(0.0f);
+                    totalEncoderValue = absolutePosition; // Reset total encoder value to current absolute position
+                    TIM2->CNT = 0; // Reset encoder count
+                    accelerationCounter = 0; // Reset acceleration counter
+                    motorState = IDLE; // Transition back to idle state
+                }
+                else if (fabsf(speed) < 1.0f) {
+                    setMotorPower(-0.7); //Can only go one way
+                    accelerationCounter++;
+                }
+                else {
+                  setMotorPower(-0.3);
+                  accelerationCounter = 0; // Reset acceleration counter if speed is not low
+                }
         }
-        lastPos = absolutePosition; // Update last position for speed calculation
+        TIM2->CNT = 0; // Reset encoder count for next measurement
     }
 }
 
@@ -307,53 +324,8 @@ float wrapAngle(float degrees) {
   return degrees;
 }
 
-/* Return the distance to the target while moving only in the allowed direction. */
-float forwardAngle(float degrees) {
-    while (degrees < 0.0f) degrees += 360.0f;
-    while (degrees >= 360.0f) degrees -= 360.0f;
-    return degrees;
-}
-
-void updateTurnProfile(void) {
-    float speedRatio;
-    float desiredPower;
-    float powerError;
-
-    turnRemainingDegrees = forwardAngle(targetPosition - absolutePosition);
-    if (turnRemainingDegrees <= TURN_STOP_TOLERANCE_DEGREES) {
-        turnCommandPower = 0.0f;
-        setMotorPower(0.0f);
-        motorState = IDLE;
-        return;
-    }
-
-    speedRatio = speed / TURN_REFERENCE_SPEED_DEG_PER_SEC;
-    if (speedRatio > 1.0f) speedRatio = 1.0f;
-    if (speedRatio < 0.0f) speedRatio = 0.0f;
-
-    // At reference speed this is 60 degrees; at lower speed it is shorter.
-    turnCoastDistanceDegrees = TURN_MIN_COAST_DEGREES +
-        (TURN_FULL_SPEED_COAST_DEGREES - TURN_MIN_COAST_DEGREES) * speedRatio * speedRatio;
-
-    if (turnRemainingDegrees <= turnCoastDistanceDegrees) {
-        // Stop driving and let the one-direction mechanism coast into the target.
-        turnCommandPower = 0.0f;
-        setMotorPower(0.0f);
-        return;
-    }
-
-    desiredPower = TURN_MAX_POWER *
-        ((turnRemainingDegrees - turnCoastDistanceDegrees) / TURN_POWER_RAMP_DEGREES);
-    if (desiredPower > TURN_MAX_POWER) desiredPower = TURN_MAX_POWER;
-    if (desiredPower < TURN_MIN_POWER) desiredPower = TURN_MIN_POWER;
-
-    // Ramp power changes to avoid an abrupt acceleration into the coast region.
-    powerError = desiredPower - turnCommandPower;
-    if (powerError > TURN_POWER_SLEW_PER_UPDATE) powerError = TURN_POWER_SLEW_PER_UPDATE;
-    if (powerError < -TURN_POWER_SLEW_PER_UPDATE) powerError = -TURN_POWER_SLEW_PER_UPDATE;
-    turnCommandPower += powerError;
-
-    setMotorPower(-turnCommandPower); // The only permitted travel direction.
+float round(float value, float multiple) {
+    return roundf(value / multiple) * multiple;
 }
 
 
@@ -365,11 +337,12 @@ void USB_CDC_RxHandler(uint8_t* Buf, uint32_t Len)
     case 'O': // Open command
         motorState = OPENING;
         TIM2->CNT = 0; // Reset encoder count
-        printf("Opening command received. Encoder target: %i ticks\n", ticksPerOpening);
+        //targetPosition = round(absolutePosition, 90.0f) + openPos; // Set target position for opening
+        targetPosition = wrapAngle(absolutePosition + openPos);
+        printf("Opening command received. Encoder target: %i ticks\n", (int) targetPosition);
         break;
     case 'T': // Turn command
-        targetPosition = wrapAngle((float)value); // Store the target in the sensor's angular range
-        turnCommandPower = 0.0f; // Every new move starts with a controlled acceleration ramp.
+        targetPosition = (float)value; // Set target position in degrees
         motorState = TURNING;
         printf("Turn command received. Target position: %.2f degrees\n", targetPosition);
         break;
@@ -377,6 +350,16 @@ void USB_CDC_RxHandler(uint8_t* Buf, uint32_t Len)
         setMotorPower(0.0f);
         motorState = IDLE; // Stop the motor
         printf("Stop command received. Motor stopped.\n");
+        break;
+    case 'C': // Close command
+        motorState = CLOSING;
+        TIM2->CNT = 0; // Reset encoder count
+        targetPosition = wrapAngle(absolutePosition + closePos); // Set target position for closing
+        printf("Closing command received. Encoder target: %i ticks\n", (int) targetPosition);
+        break;
+    case 'H': // Home command
+        motorState = HOMING;
+        printf("Home command received. Starting homing sequence.\n");
         break;
     default:
         // Unknown command, ignore
