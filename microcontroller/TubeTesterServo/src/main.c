@@ -154,9 +154,8 @@ int main(void)
   /* USER CODE BEGIN WHILE */
   while (1)
   {
-    
-    printf("Absolute Position: %i degrees, Encoder Value: %i, Target: %i degrees, Speed: %i deg/s\n", (int)absolutePosition, (int)(totalEncoderValue), (int)targetPosition, (int) speed);
-    HAL_Delay(10); // Delay for 0.1 second
+    //printf("Absolute Position: %i degrees, Encoder Value: %i, Target: %i degrees, Speed: %i deg/s\n", (int)absolutePosition, (int)(totalEncoderValue), (int)targetPosition, (int) speed);
+    //HAL_Delay(10); // Delay for 0.1 second
     /* USER CODE END WHILE */
 
     /* USER CODE BEGIN 3 */
@@ -264,7 +263,7 @@ void HAL_TIM_IC_CaptureCallback(TIM_HandleTypeDef *htim) {
             case OPENING:
                 if (fabsf(wrapAngle(fmod(absolutePosition + openPos  - totalEncoderValue, 90.0f))) < 3.0f) { // If close to target
                     setMotorPower(0.0f); // Stop the motor
-                    
+                    printf("D\n");
                     motorState = IDLE; // Transition to idle state
                 } else if (fabsf(speed) < 1.0f) {
                     setMotorPower(1.0f); //Can only go one way
@@ -276,7 +275,7 @@ void HAL_TIM_IC_CaptureCallback(TIM_HandleTypeDef *htim) {
             case CLOSING:
                 if (fabsf(wrapAngle(fmod(absolutePosition + closePos - totalEncoderValue, 90.0f))) < 3.0f) { // If close to target
                     setMotorPower(0.0f); // Stop the motor
-                    
+                    printf("D\n");
                     motorState = IDLE; // Transition to idle state
                 } else if (fabsf(speed) < 1.0f) {
                     setMotorPower(1.0f); //Can only go one way
@@ -290,6 +289,7 @@ void HAL_TIM_IC_CaptureCallback(TIM_HandleTypeDef *htim) {
                 if (fabsf(wrapAngle(targetPosition - absolutePosition)) < 5.0f) {
                     //setMotorPower(1.0f); // Stop the motor when close to target
                     setMotorPower(0.0f); // Stop the motor when close to target
+                    printf("D\n");
                     motorState = IDLE; // Transition back to idle state
                 } else if (fabsf(speed) < 1.0f) {
                     setMotorPower(-0.6); //Can only go one way
@@ -305,6 +305,7 @@ void HAL_TIM_IC_CaptureCallback(TIM_HandleTypeDef *htim) {
                     TIM2->CNT = 0; // Reset encoder count
                     accelerationCounter = 0; // Reset acceleration counter
                     stallCounter = 0; // Reset stall counter
+                    printf("D\n");
                     motorState = IDLE; // Transition back to idle state
                 }
                 else if (fabsf(speed) < 1.0f && accelerationCounter > 50) { // If speed is low and enough time has passed
@@ -342,32 +343,33 @@ void USB_CDC_RxHandler(uint8_t* Buf, uint32_t Len)
     case 'O': // Open command
         motorState = OPENING;
         TIM2->CNT = 0; // Reset encoder count
-        printf("Opening command received. Encoder target: %i ticks\n", (int) targetPosition);
+        //printf("Opening command received. Encoder target: %i ticks\n", (int) targetPosition);
         break;
     case 'T': // Turn command
         targetPosition = (float)value; // Set target position in degrees
         motorState = TURNING;
-        printf("Turn command received. Target position: %.2f degrees\n", targetPosition);
+        //printf("Turn command received. Target position: %.2f degrees\n", targetPosition);
         break;
     case 'S': // Stop command
         setMotorPower(0.0f);
         motorState = IDLE; // Stop the motor
-        printf("Stop command received. Motor stopped.\n");
+        //printf("Stop command received. Motor stopped.\n");
         break;
     case 'C': // Close command
         motorState = CLOSING;
         TIM2->CNT = 0; // Reset encoder count
-        printf("Closing command received. Encoder target: %i ticks\n", (int) targetPosition);
+        //printf("Closing command received. Encoder target: %i ticks\n", (int) targetPosition);
         break;
     case 'H': // Home command
         motorState = HOMING;
-        printf("Home command received. Starting homing sequence.\n");
+        //printf("Home command received. Starting homing sequence.\n");
         break;
     default:
         // Unknown command, ignore
-        printf("What are you talking about like %c ahh\n", cmd);
+        //printf("What are you talking about like %c ahh\n", cmd);
         break;
   }
+  printf("%c\n", cmd);
 }
 /* USER CODE END 4 */
 
