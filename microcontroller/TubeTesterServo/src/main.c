@@ -58,8 +58,8 @@ float totalEncoderValue = 0;
 float absolutePosition = 0.0f;
 float degreesPerTick = 360.0f / 5820.0f;
 
-float openPos = 75.0f;
-float closePos = 100.0f;
+float openPos = 82.0f;
+float closePos = 110.0f;
 
 
 float targetPosition = 0.0f; // Target position in degrees
@@ -72,6 +72,7 @@ int16_t lastPos = 0; // Last position for calculating speed
 int16_t speed = 0; // Speed in degrees per second
 MotorState motorState = IDLE; // Current state of the motor
 uint8_t accelerationCounter = 0;
+uint8_t stallCounter = 0;
 
 /* USER CODE END PV */
 
@@ -261,7 +262,7 @@ void HAL_TIM_IC_CaptureCallback(TIM_HandleTypeDef *htim) {
                 setMotorPower(0.0f); // Ensure motor is stopped
                 break;
             case OPENING:
-                if (fabsf(wrapAngle(totalEncoderValue - targetPosition)) < 5.0f) { // If close to target
+                if (fabsf(wrapAngle(fmod(absolutePosition + openPos  - totalEncoderValue, 90.0f))) < 3.0f) { // If close to target
                     setMotorPower(0.0f); // Stop the motor
                     
                     motorState = IDLE; // Transition to idle state
@@ -273,7 +274,7 @@ void HAL_TIM_IC_CaptureCallback(TIM_HandleTypeDef *htim) {
                 }
                 break;
             case CLOSING:
-                if (fabsf(wrapAngle(totalEncoderValue - targetPosition)) < 5.0f) { // If close to target
+                if (fabsf(wrapAngle(fmod(absolutePosition + closePos - totalEncoderValue, 90.0f))) < 3.0f) { // If close to target
                     setMotorPower(0.0f); // Stop the motor
                     
                     motorState = IDLE; // Transition to idle state
@@ -298,12 +299,16 @@ void HAL_TIM_IC_CaptureCallback(TIM_HandleTypeDef *htim) {
                 }
                 break;
             case HOMING:
-                if (fabsf(speed) < 1.0f && accelerationCounter > 50) { // If speed is low and enough time has passed
+                if (stallCounter > 200) {
                     setMotorPower(0.0f);
                     totalEncoderValue = absolutePosition; // Reset total encoder value to current absolute position
                     TIM2->CNT = 0; // Reset encoder count
                     accelerationCounter = 0; // Reset acceleration counter
+                    stallCounter = 0; // Reset stall counter
                     motorState = IDLE; // Transition back to idle state
+                }
+                else if (fabsf(speed) < 1.0f && accelerationCounter > 50) { // If speed is low and enough time has passed
+                    stallCounter++;
                 }
                 else if (fabsf(speed) < 1.0f) {
                     setMotorPower(-0.7); //Can only go one way
@@ -337,8 +342,6 @@ void USB_CDC_RxHandler(uint8_t* Buf, uint32_t Len)
     case 'O': // Open command
         motorState = OPENING;
         TIM2->CNT = 0; // Reset encoder count
-        //targetPosition = round(absolutePosition, 90.0f) + openPos; // Set target position for opening
-        targetPosition = wrapAngle(absolutePosition + openPos);
         printf("Opening command received. Encoder target: %i ticks\n", (int) targetPosition);
         break;
     case 'T': // Turn command
@@ -354,7 +357,6 @@ void USB_CDC_RxHandler(uint8_t* Buf, uint32_t Len)
     case 'C': // Close command
         motorState = CLOSING;
         TIM2->CNT = 0; // Reset encoder count
-        targetPosition = wrapAngle(absolutePosition + closePos); // Set target position for closing
         printf("Closing command received. Encoder target: %i ticks\n", (int) targetPosition);
         break;
     case 'H': // Home command
