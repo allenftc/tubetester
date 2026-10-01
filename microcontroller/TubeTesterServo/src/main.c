@@ -34,7 +34,8 @@ typedef enum MotorState {
     OPENING,
     TURNING,
     CLOSING,
-    HOMING
+    HOMING,
+    SCANNING
 } MotorState;
 /* USER CODE END PTD */
 
@@ -73,6 +74,7 @@ int16_t speed = 0; // Speed in degrees per second
 MotorState motorState = IDLE; // Current state of the motor
 uint8_t accelerationCounter = 0;
 uint8_t stallCounter = 0;
+uint8_t wrapFlag = 0;
 
 /* USER CODE END PV */
 
@@ -153,8 +155,8 @@ int main(void)
   /* Infinite loop */
   /* USER CODE BEGIN WHILE */
   while (1)
-  {
-    //printf("Absolute Position: %i degrees, Encoder Value: %i, Target: %i degrees, Speed: %i deg/s\n", (int)absolutePosition, (int)(totalEncoderValue), (int)targetPosition, (int) speed);
+  { 
+    printf("Absolute Position: %i degrees, Encoder Value: %i, Target: %i degrees, Speed: %i deg/s, Wrap Flag: %i, Error: %i\n", (int)absolutePosition, (int)(totalEncoderValue), (int)targetPosition, (int) speed, wrapFlag, (int)(fabsf(wrapAngle(targetPosition - absolutePosition))));
     //HAL_Delay(10); // Delay for 0.1 second
     /* USER CODE END WHILE */
 
@@ -297,7 +299,7 @@ void HAL_TIM_IC_CaptureCallback(TIM_HandleTypeDef *htim) {
                 else {
                   setMotorPower(-0.15);
                 }
-                break;
+              break;
             case HOMING:
                 if (stallCounter > 200) {
                     setMotorPower(0.0f);
@@ -319,6 +321,26 @@ void HAL_TIM_IC_CaptureCallback(TIM_HandleTypeDef *htim) {
                   setMotorPower(-0.3);
                   accelerationCounter = 0; // Reset acceleration counter if speed is not low
                 }
+              case SCANNING:
+                // Control the motor to reach the target position
+                if (wrapAngle(targetPosition - absolutePosition) < 0.0f && wrapFlag != 0) {
+                    setMotorPower(0.0f); // Stop the motor when close to target
+                    printf("D\n");
+                    motorState = IDLE; // Transition back to idle state
+                } else if (fabsf(speed) < 1.0f) {
+                    setMotorPower(-0.6); //Can only go one way
+                    if (fabsf(wrapAngle(targetPosition - absolutePosition)) > 90.0f) {
+                        wrapFlag = 1; // Set wrap flag when close to target
+                    }
+                }
+                else {
+                  setMotorPower(-0.15);
+                  if (fabsf(wrapAngle(targetPosition - absolutePosition)) > 90.0f) {
+                        wrapFlag = 1; // Set wrap flag when close to target
+                    }
+                }
+              break;
+          
         }
         TIM2->CNT = 0; // Reset encoder count for next measurement
     }
@@ -357,12 +379,17 @@ void USB_CDC_RxHandler(uint8_t* Buf, uint32_t Len)
         break;
     case 'C': // Close command
         motorState = CLOSING;
-        TIM2->CNT = 0; // Reset encoder count
         //printf("Closing command received. Encoder target: %i ticks\n", (int) targetPosition);
         break;
     case 'H': // Home command
         motorState = HOMING;
         //printf("Home command received. Starting homing sequence.\n");
+        break;
+    case 'L': // Scan command
+        targetPosition = absolutePosition;
+        wrapFlag = 0;
+        motorState = SCANNING;
+        //printf("Scan command received. Starting scanning sequence.\n");
         break;
     default:
         // Unknown command, ignore
