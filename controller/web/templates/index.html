@@ -86,6 +86,55 @@
       <div id="tube-details" class="tube-details" aria-live="polite">Select a tube to inspect its calibrated position and result.</div>
     </section>
 
+    <section class="macro-card card" aria-labelledby="macro-title">
+      <div class="section-heading">
+        <div><p class="eyebrow">KLIPPER + DEDICATED CLAW</p><h2 id="macro-title">Combined macros</h2></div>
+      </div>
+      <div class="controls macro-controls" aria-label="Combined Klipper and claw macro controls">
+        <div class="control-item">
+          <button id="macro-calibrate-button" class="secondary" title="Move Y to 0, X to 237, then calibrate the claw." disabled>Calibrate</button>
+          <small>Y0 @ 250 mm/s · X237 @ 30 mm/s · claw H</small>
+        </div>
+        <div class="control-item">
+          <button id="macro-pickup-button" class="primary" title="Open claw, lower to Z0, close claw, then lift to Z150." disabled>Pickup</button>
+          <small>Open · Z0 · close · Z150</small>
+        </div>
+        <div class="control-item">
+          <button id="macro-deposit-button" class="secondary" title="Move to Z20, open the claw, then lift to Z50." disabled>Deposit</button>
+          <small>Z20 · open · Z50</small>
+        </div>
+      </div>
+    </section>
+
+    <section class="claw-card card" aria-labelledby="claw-title">
+      <div class="section-heading">
+        <div><p class="eyebrow">DEDICATED USB CDC CONTROLLER</p><h2 id="claw-title">Claw controls</h2></div>
+        <span id="claw-chip" class="chip neutral">CLAW READY</span>
+      </div>
+      <div class="controls claw-controls" aria-label="Claw controls">
+        <div class="control-item">
+          <button id="claw-open-button" class="secondary" title="Send O to open the claw." disabled>Open Claw</button>
+          <small>USB CDC: O</small>
+        </div>
+        <div class="control-item">
+          <button id="claw-close-button" class="secondary" title="Send C to close the claw." disabled>Close Claw</button>
+          <small>USB CDC: C</small>
+        </div>
+        <div class="control-item">
+          <button id="claw-calibrate-button" class="secondary" title="Send H to calibrate the claw." disabled>Calibrate Claw</button>
+          <small>USB CDC: H</small>
+        </div>
+        <div class="control-item claw-turn-control">
+          <label for="claw-degrees-input">Turn position (degrees)</label>
+          <div class="inline-control">
+            <input id="claw-degrees-input" type="number" step="1" inputmode="numeric" autocomplete="off" placeholder="45" disabled>
+            <button id="claw-turn-button" class="secondary" title="Send T followed by the requested whole-number angle." disabled>Turn</button>
+          </div>
+          <small>USB CDC: T<degrees></small>
+        </div>
+      </div>
+    </section>
+
     <section id="console-card" class="console-card card" aria-labelledby="console-title">
       <div class="console-header">
         <div><p class="eyebrow">KLIPPER</p><h2 id="console-title">Console</h2></div>

@@ -31,6 +31,28 @@ class FakeMoonraker:
         return MoonrakerResponse(self.ready, 200 if self.ready else 0, error_message=None if self.ready else "offline")
 
 
+class FakeClaw:
+    def __init__(self) -> None:
+        self.commands: list[str] = []
+
+    def open(self) -> str:
+        self.commands.append("O")
+        return "O"
+
+    def close(self) -> str:
+        self.commands.append("C")
+        return "C"
+
+    def calibrate(self) -> str:
+        self.commands.append("H")
+        return "H"
+
+    def turn_to_position(self, degrees: int) -> str:
+        command = f"T{degrees}"
+        self.commands.append(command)
+        return command
+
+
 class FakeQr:
     async def decode(self, row: int, column: int, yaw_angle_deg: float) -> None:
         return None
@@ -39,7 +61,8 @@ class FakeQr:
 class WebTests(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self) -> None:
         self.settings = load_settings(Path(__file__).resolve().parents[1] / "calibration")
-        self.runtime = WorkflowRuntime(self.settings, moonraker=FakeMoonraker())
+        self.claw = FakeClaw()
+        self.runtime = WorkflowRuntime(self.settings, moonraker=FakeMoonraker(), claw=self.claw)
         self.client = TestClient(TestServer(create_control_app(self.settings, runtime=self.runtime, initialize_hardware=False)))
         await self.client.start_server()
 
@@ -76,6 +99,42 @@ class WebTests(unittest.IsolatedAsyncioTestCase):
         invalid = await self.client.post("/api/gcode", json={"script": " "})
         self.assertEqual(invalid.status, 400)
 
+    async def test_claw_endpoints_send_dedicated_usb_cdc_commands(self) -> None:
+        for endpoint, body, action in (
+            ("/api/claw/open", {}, "claw.open"),
+            ("/api/claw/close", {}, "claw.close"),
+            ("/api/claw/calibrate", {}, "claw.calibrate"),
+            ("/api/claw/turn", {"degrees": 45}, "claw.turn"),
+        ):
+            response = await self.client.post(endpoint, json=body)
+            payload = await response.json()
+            self.assertEqual(response.status, 200)
+            self.assertEqual(payload["action"], action)
+        self.assertEqual(self.claw.commands, ["O", "C", "H", "T45"])
+
+        invalid = await self.client.post("/api/claw/turn", json={"degrees": 45.5})
+        self.assertEqual(invalid.status, 400)
+
+    async def test_combined_macro_endpoints(self) -> None:
+        ready_moonraker = FakeMoonraker(ready=True)
+        claw = FakeClaw()
+        runtime = WorkflowRuntime(self.settings, moonraker=ready_moonraker, claw=claw)
+        await runtime.refresh_machine()
+        client = TestClient(TestServer(create_control_app(self.settings, runtime=runtime, initialize_hardware=False)))
+        await client.start_server()
+        try:
+            for endpoint, action in (
+                ("/api/macros/calibrate", "macro.calibrate"),
+                ("/api/macros/pickup", "macro.pickup"),
+                ("/api/macros/deposit", "macro.deposit"),
+            ):
+                response = await client.post(endpoint, json={})
+                payload = await response.json()
+                self.assertEqual(response.status, 200)
+                self.assertEqual(payload["action"], action)
+        finally:
+            await client.close()
+
     async def test_websocket_delivers_snapshot(self) -> None:
         socket = await self.client.ws_connect("/ws")
         hello = await socket.receive_json()
@@ -86,6 +145,28 @@ class WebTests(unittest.IsolatedAsyncioTestCase):
 
 
 class RuntimeTests(unittest.IsolatedAsyncioTestCase):
+    async def test_combined_macros_execute_klipper_and_claw_steps_in_order(self) -> None:
+        settings = load_settings(Path(__file__).resolve().parents[1] / "calibration")
+        moonraker = FakeMoonraker(ready=True)
+        claw = FakeClaw()
+        runtime = WorkflowRuntime(settings, moonraker=moonraker, claw=claw)
+        await runtime.refresh_machine()
+
+        calibration = await runtime.calibrate_claw_macro()
+        self.assertEqual(calibration["action"], "macro.calibrate")
+        self.assertEqual(moonraker.commands, ["G1 Y0.000 F15000\nM400", "G1 X237.000 F1800\nM400"])
+        self.assertEqual(claw.commands, ["H"])
+
+        pickup = await runtime.pickup_macro()
+        self.assertEqual(pickup["action"], "macro.pickup")
+        self.assertEqual(moonraker.commands[2:], ["G1 Z0.000 F10000\nM400", "G1 Z150.000 F10000\nM400"])
+        self.assertEqual(claw.commands[1:], ["O", "C"])
+
+        deposit = await runtime.deposit_macro()
+        self.assertEqual(deposit["action"], "macro.deposit")
+        self.assertEqual(moonraker.commands[4:], ["G1 Z20.000 F10000\nM400", "G1 Z50.000 F10000\nM400"])
+        self.assertEqual(claw.commands[3:], ["O"])
+
     async def test_background_start_and_duplicate_guard(self) -> None:
         settings = load_settings(Path(__file__).resolve().parents[1] / "calibration")
         moonraker = FakeMoonraker(ready=True, delay=0.04)

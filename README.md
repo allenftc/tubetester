@@ -40,6 +40,27 @@ Start the local web control surface:
 python -m controller.main --serve-web
 ```
 
+## Claw USB CDC control
+
+The claw uses a dedicated USB CDC device and does not send commands through the SKR/Moonraker path. Configure its device node in [`calibration/network.json`](calibration/network.json), for example `/dev/ttyACM0`.
+
+The web control surface provides dedicated actions that transmit these exact frames without a trailing newline:
+
+- Open: `O`
+- Close: `C`
+- Calibrate: `H`
+- Turn to a whole-number position: `T<degrees>` (for example `T45`)
+
+## Combined Klipper and claw macros
+
+The control UI provides sequential macros that wait for each Klipper move using `M400` before continuing to the following claw action:
+
+- **Calibrate:** Y0 at 250 mm/s, X237 at 30 mm/s, then claw calibrate (`H`).
+- **Pickup:** claw open (`O`), Z0, claw close (`C`), then Z150.
+- **Deposit:** Z20, claw open (`O`), then Z50.
+
+Each macro requires Klipper to be ready and the scan workflow to be inactive. A failed motion or claw command stops the remaining macro steps.
+
 ## Next steps
 
 1. Wire the controller to a real Klipper transport.

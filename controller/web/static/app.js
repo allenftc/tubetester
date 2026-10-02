@@ -1,7 +1,7 @@
 "use strict";
 
 const LEVELS = ["debug", "info", "warning", "error"];
-const SOURCES = ["controller", "workflow", "moonraker", "klipper", "camera", "qr", "user"];
+const SOURCES = ["controller", "workflow", "moonraker", "klipper", "claw", "camera", "qr", "user"];
 const ACTIVE_TUBES = new Set(["approaching", "picked_up", "scanning"]);
 const state = {
   snapshot: null,
@@ -79,6 +79,7 @@ function renderSnapshot(snapshot) {
   setChip("position-chip", p ? `Position X ${number(p.x)} Y ${number(p.y)} Z ${number(p.z)}` : "Position Unknown", "neutral");
   setChip("workflow-chip", workflow.state.toUpperCase(), workflow.state);
   setChip("qr-chip", snapshot.capabilities.qr ? "QR READY" : "QR UNAVAILABLE", snapshot.capabilities.qr ? "ready" : "warning");
+  setChip("claw-chip", snapshot.capabilities.claw ? "CLAW READY" : "CLAW UNAVAILABLE", snapshot.capabilities.claw ? "ready" : "error");
   const current = workflow.current;
   setChip("coordinate-chip", current?.row ? `R${current.row} C${current.column}` : "NO TUBE", current?.row ? "active" : "neutral");
   setText("current-description", current?.description || workflow.last_error || "Waiting for a scan.");
@@ -114,6 +115,9 @@ function setCapabilities(caps, workflowState) {
   pause.disabled = resume ? !caps.resume : !caps.pause;
   el("gcode-input").disabled = !caps.send_gcode;
   el("send-button").disabled = !caps.send_gcode || !el("gcode-input").value.trim();
+  ["claw-open-button", "claw-close-button", "claw-calibrate-button", "claw-degrees-input"].forEach(id => { el(id).disabled = !caps.claw; });
+  el("claw-turn-button").disabled = !caps.claw || !isWholeNumber(el("claw-degrees-input").value);
+  ["macro-calibrate-button", "macro-pickup-button", "macro-deposit-button"].forEach(id => { el(id).disabled = !caps.send_gcode; });
 }
 
 function renderStepper(currentPhase, workflowState) {
@@ -224,6 +228,14 @@ function wireControls() {
   });
   el("pause-button").addEventListener("click", () => act(state.snapshot?.workflow.state === "paused" ? "/api/workflow/resume" : "/api/workflow/pause"));
   el("stop-button").addEventListener("click", async () => { if (confirm("Stop after the active command? This is not an emergency stop.")) await act("/api/workflow/stop"); });
+  el("macro-calibrate-button").addEventListener("click", () => act("/api/macros/calibrate"));
+  el("macro-pickup-button").addEventListener("click", () => act("/api/macros/pickup"));
+  el("macro-deposit-button").addEventListener("click", () => act("/api/macros/deposit"));
+  el("claw-open-button").addEventListener("click", () => act("/api/claw/open"));
+  el("claw-close-button").addEventListener("click", () => act("/api/claw/close"));
+  el("claw-calibrate-button").addEventListener("click", () => act("/api/claw/calibrate"));
+  el("claw-turn-button").addEventListener("click", sendClawTurn);
+  el("claw-degrees-input").addEventListener("input", event => { el("claw-turn-button").disabled = event.target.disabled || !isWholeNumber(event.target.value); });
   el("gcode-input").addEventListener("input", event => { el("send-button").disabled = event.target.disabled || !event.target.value.trim(); });
   el("gcode-form").addEventListener("submit", sendGcode);
   el("clear-console").addEventListener("click", () => { state.clearWatermark = new Date().toISOString(); sessionStorage.setItem("console-clear-watermark", state.clearWatermark); renderConsole(); });
@@ -236,6 +248,15 @@ function applyCollapsedPreference() { if (localStorage.getItem("console-collapse
 async function act(path, body = {}) { try { const result = await api(path, body); announce(result.message); } catch (error) { announce(error.message); alert(error.message); } }
 async function preview() { try { const result = await api("/api/actions/preview"); const panel = el("preview-result"); panel.hidden = false; panel.textContent = `${result.plan.tube_count} tubes · ${result.plan.step_count} motion steps · ${result.plan.yaw_angles_deg.length} yaw angles. ${result.validation.valid ? "Validation passed." : result.validation.issues.map(issue => issue.message).join(" ")}`; } catch (error) { alert(error.message); } }
 async function sendGcode(event) { event.preventDefault(); const input = el("gcode-input"); const script = input.value.trim(); if (!script) return; try { await api("/api/gcode", {script}); input.value = ""; el("send-button").disabled = true; } catch (error) { alert(error.message); } }
+function isWholeNumber(value) { return /^-?\d+$/.test(String(value).trim()); }
+async function sendClawTurn() {
+  const input = el("claw-degrees-input");
+  if (!isWholeNumber(input.value)) return;
+  try {
+    const result = await api("/api/claw/turn", {degrees: Number(input.value)});
+    announce(result.message);
+  } catch (error) { announce(error.message); alert(error.message); }
+}
 function announce(message) { setText("announcer", message); }
 
 document.addEventListener("DOMContentLoaded", bootstrap);

@@ -8,7 +8,7 @@ from datetime import datetime, timezone
 from typing import Any
 
 _LEVELS = {"debug", "info", "warning", "error"}
-_SOURCES = {"controller", "workflow", "moonraker", "klipper", "camera", "qr", "user"}
+_SOURCES = {"controller", "workflow", "moonraker", "klipper", "claw", "camera", "qr", "user"}
 _ERROR_RE = re.compile(r"(?:\berror\b|!!|unknown command|unable|failed)", re.IGNORECASE)
 _WARNING_RE = re.compile(r"(?:\bwarning\b|\bwarn\b|not ready|timeout)", re.IGNORECASE)
 _SECRET_RE = re.compile(

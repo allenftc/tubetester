@@ -8,6 +8,7 @@ from importlib.metadata import PackageNotFoundError, version
 from typing import Any, Protocol
 
 from controller.config.settings import ControllerSettings
+from controller.motion.claw_client import ClawCommunicationError, ClawUsbCdcClient
 from controller.motion.klipper_client import KlipperMotionClient
 from controller.network.moonraker import MoonrakerClient, MoonrakerResponse
 from controller.workflow.state_machine import ScanStep, TubeScanWorkflow
@@ -44,18 +45,22 @@ class WorkflowRuntime:
         self,
         settings: ControllerSettings,
         moonraker: MoonrakerClient | None = None,
+        claw: ClawUsbCdcClient | None = None,
         events: EventStore | None = None,
         qr_backend: QrBackend | None = None,
         macros_available: bool = False,
     ) -> None:
         self.settings = settings
         self.moonraker = moonraker or MoonrakerClient(settings.network.moonraker)
+        self.claw = claw or ClawUsbCdcClient(settings.network.claw.usb_cdc_device)
         self.events = events or EventStore()
         self.qr_backend = qr_backend
         self.macros_available = macros_available
         self.motion = KlipperMotionClient()
         self.workflow_builder = TubeScanWorkflow(settings)
         self._lock = asyncio.Lock()
+        self._claw_lock = asyncio.Lock()
+        self._manual_macro_lock = asyncio.Lock()
         self._pause_gate = asyncio.Event()
         self._pause_gate.set()
         self._stop_requested = asyncio.Event()
@@ -132,6 +137,7 @@ class WorkflowRuntime:
             "resume": workflow["state"] == "paused",
             "stop": workflow["state"] in _ACTIVE_STATES,
             "send_gcode": machine["klipper_state"] == "ready" and not active,
+            "claw": True,
             "qr": self.qr_backend is not None,
             "degraded_mode": degraded_available,
         }
@@ -184,6 +190,60 @@ class WorkflowRuntime:
         if not snapshot["capabilities"]["send_gcode"]:
             raise RuntimeUnavailable("Klipper must be ready and the workflow inactive to send G-code.")
         return await self._send_action("gcode.send", script, source="user")
+
+    async def claw_open(self) -> dict[str, Any]:
+        return await self._send_claw_action("claw.open", self.claw.open)
+
+    async def claw_close(self) -> dict[str, Any]:
+        return await self._send_claw_action("claw.close", self.claw.close)
+
+    async def claw_calibrate(self) -> dict[str, Any]:
+        return await self._send_claw_action("claw.calibrate", self.claw.calibrate)
+
+    async def claw_turn_to_position(self, degrees: int) -> dict[str, Any]:
+        return await self._send_claw_action(
+            "claw.turn",
+            lambda: self.claw.turn_to_position(degrees),
+            message=f"Claw turn to {degrees}° command accepted.",
+        )
+
+    async def calibrate_claw_macro(self) -> dict[str, Any]:
+        return await self._run_manual_macro(
+            "macro.calibrate",
+            "Calibration macro completed.",
+            (
+                ("gcode", self.motion.synchronized_move_command(z=150, feedrate=10000)),
+                ("gcode", self.motion.synchronized_move_command(x=200, feedrate=15000)),
+                ("gcode", self.motion.synchronized_move_command(y=0, feedrate=15000)),
+                ("gcode", self.motion.synchronized_move_command(z=0, feedrate=10000)),
+                ("gcode", self.motion.synchronized_move_command(x=239, feedrate=1800)),
+                ("claw", self.claw.calibrate),
+                ("gcode", self.motion.synchronized_move_command(z=100, feedrate=15000)),
+            ),
+        )
+
+    async def pickup_macro(self) -> dict[str, Any]:
+        return await self._run_manual_macro(
+            "macro.pickup",
+            "Pickup macro completed.",
+            (
+                ("claw", self.claw.open),
+                ("gcode", self.motion.synchronized_move_command(z=0, feedrate=10000)),
+                ("claw", self.claw.close),
+                ("gcode", self.motion.synchronized_move_command(z=150, feedrate=10000)),
+            ),
+        )
+
+    async def deposit_macro(self) -> dict[str, Any]:
+        return await self._run_manual_macro(
+            "macro.deposit",
+            "Deposit macro completed.",
+            (
+                ("gcode", self.motion.synchronized_move_command(z=20, feedrate=10000)),
+                ("claw", self.claw.open),
+                ("gcode", self.motion.synchronized_move_command(z=50, feedrate=10000)),
+            ),
+        )
 
     async def start(
         self,
@@ -373,6 +433,72 @@ class WorkflowRuntime:
             raise RuntimeUnavailable(message)
         self.events.publish("Command accepted by Moonraker.", source="moonraker", correlation_id=correlation_id)
         return self._action(action, "Command accepted.")
+
+    async def _send_claw_action(
+        self,
+        action: str,
+        command_sender: Any,
+        *,
+        message: str = "Claw command accepted.",
+    ) -> dict[str, Any]:
+        correlation_id = f"req_{uuid.uuid4().hex}"
+        async with self._claw_lock:
+            try:
+                command = await asyncio.to_thread(command_sender)
+            except (ClawCommunicationError, ValueError) as exc:
+                self.events.publish(str(exc), source="claw", level="error", correlation_id=correlation_id)
+                raise RuntimeUnavailable(str(exc)) from exc
+            except Exception as exc:  # defensive boundary around hardware adapter
+                self.events.publish(f"Claw command failed: {exc}", source="claw", level="error", correlation_id=correlation_id)
+                raise RuntimeUnavailable("Unable to send the claw command.") from exc
+        self.events.publish(f"USB CDC command sent: {command}", source="claw", command=command, correlation_id=correlation_id)
+        return self._action(action, message)
+
+    async def _run_manual_macro(
+        self,
+        action: str,
+        message: str,
+        steps: tuple[tuple[str, Any], ...],
+    ) -> dict[str, Any]:
+        snapshot = await self.snapshot()
+        if not snapshot["capabilities"]["send_gcode"]:
+            raise RuntimeUnavailable("Klipper must be ready and the workflow inactive before running a claw macro.")
+        correlation_id = f"req_{uuid.uuid4().hex}"
+        async with self._manual_macro_lock:
+            self.events.publish(f"Starting {action}.", source="user", correlation_id=correlation_id)
+            for kind, value in steps:
+                if kind == "gcode":
+                    await self._send_macro_gcode(value, correlation_id)
+                elif kind == "claw":
+                    await self._send_macro_claw(value, correlation_id)
+                else:  # defensive validation for internal macro definitions
+                    raise RuntimeError(f"Unknown manual macro step type: {kind}")
+        self.events.publish(message, source="controller", correlation_id=correlation_id)
+        return self._action(action, message)
+
+    async def _send_macro_gcode(self, script: str, correlation_id: str) -> None:
+        self.events.publish(script, source="user", command=script, correlation_id=correlation_id)
+        try:
+            response = await asyncio.to_thread(self.moonraker.send_gcode, script)
+        except Exception as exc:
+            response = MoonrakerResponse(False, 0, error_message=str(exc))
+        if not response.ok:
+            message = response.error_message or "Moonraker rejected the macro motion command."
+            self.events.publish(message, source="moonraker", level="error", correlation_id=correlation_id)
+            raise RuntimeUnavailable(message)
+        self.events.publish("Macro motion completed.", source="moonraker", correlation_id=correlation_id)
+
+    async def _send_macro_claw(self, command_sender: Any, correlation_id: str) -> None:
+        async with self._claw_lock:
+            try:
+                command = await asyncio.to_thread(command_sender)
+            except (ClawCommunicationError, ValueError) as exc:
+                self.events.publish(str(exc), source="claw", level="error", correlation_id=correlation_id)
+                raise RuntimeUnavailable(str(exc)) from exc
+            except Exception as exc:  # defensive boundary around hardware adapter
+                self.events.publish(f"Claw command failed: {exc}", source="claw", level="error", correlation_id=correlation_id)
+                raise RuntimeUnavailable("Unable to send the claw command.") from exc
+        self.events.publish(f"USB CDC command sent: {command}", source="claw", command=command, correlation_id=correlation_id)
 
     def _command_for(self, step: ScanStep) -> str:
         if step.name == "home":

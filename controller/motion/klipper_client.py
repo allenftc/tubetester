@@ -23,7 +23,7 @@ class KlipperMotionClient:
         z: float | None = None,
         feedrate: float | None = None,
     ) -> str:
-        parts = ["G1"]
+        parts = ["G90\nG1"]
         if x is not None:
             parts.append(f"X{x:.3f}")
         if y is not None:
@@ -42,6 +42,17 @@ class KlipperMotionClient:
 
     def set_yaw_command(self, angle_deg: float) -> str:
         return f"{self.yaw_macro} ANGLE={angle_deg:.2f}"
+
+    def synchronized_move_command(
+        self,
+        *,
+        x: float | None = None,
+        y: float | None = None,
+        z: float | None = None,
+        feedrate: float,
+    ) -> str:
+        """Move and wait until Klipper completes the physical motion."""
+        return f"{self.move_command(x=x, y=y, z=z, feedrate=feedrate)}\nM400"
 
     def safe_z_command(self) -> str:
         return self.safe_z_macro

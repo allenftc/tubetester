@@ -34,6 +34,13 @@ def create_control_app(
     app.router.add_get("/api/status", _status)
     app.router.add_post("/api/actions/home", _home)
     app.router.add_post("/api/actions/preview", _preview)
+    app.router.add_post("/api/claw/open", _claw_open)
+    app.router.add_post("/api/claw/close", _claw_close)
+    app.router.add_post("/api/claw/calibrate", _claw_calibrate)
+    app.router.add_post("/api/claw/turn", _claw_turn)
+    app.router.add_post("/api/macros/calibrate", _macro_calibrate)
+    app.router.add_post("/api/macros/pickup", _macro_pickup)
+    app.router.add_post("/api/macros/deposit", _macro_deposit)
     app.router.add_post("/api/workflow/start", _start)
     app.router.add_post("/api/workflow/pause", _pause)
     app.router.add_post("/api/workflow/resume", _resume)
@@ -113,6 +120,44 @@ async def _home(request: web.Request) -> web.Response:
 async def _preview(request: web.Request) -> web.Response:
     await _json_body(request, allow_empty=True)
     return web.json_response(request.app["runtime"].preview())
+
+
+async def _claw_open(request: web.Request) -> web.Response:
+    await _json_body(request, allow_empty=True)
+    return web.json_response(await request.app["runtime"].claw_open())
+
+
+async def _claw_close(request: web.Request) -> web.Response:
+    await _json_body(request, allow_empty=True)
+    return web.json_response(await request.app["runtime"].claw_close())
+
+
+async def _claw_calibrate(request: web.Request) -> web.Response:
+    await _json_body(request, allow_empty=True)
+    return web.json_response(await request.app["runtime"].claw_calibrate())
+
+
+async def _claw_turn(request: web.Request) -> web.Response:
+    body = await _json_body(request)
+    degrees = body.get("degrees")
+    if isinstance(degrees, bool) or not isinstance(degrees, int):
+        raise ValueError("degrees must be an integer")
+    return web.json_response(await request.app["runtime"].claw_turn_to_position(degrees))
+
+
+async def _macro_calibrate(request: web.Request) -> web.Response:
+    await _json_body(request, allow_empty=True)
+    return web.json_response(await request.app["runtime"].calibrate_claw_macro())
+
+
+async def _macro_pickup(request: web.Request) -> web.Response:
+    await _json_body(request, allow_empty=True)
+    return web.json_response(await request.app["runtime"].pickup_macro())
+
+
+async def _macro_deposit(request: web.Request) -> web.Response:
+    await _json_body(request, allow_empty=True)
+    return web.json_response(await request.app["runtime"].deposit_macro())
 
 
 async def _start(request: web.Request) -> web.Response:

@@ -86,9 +86,15 @@ class WebSettings:
 
 
 @dataclass(frozen=True)
+class ClawSettings:
+    usb_cdc_device: Path
+
+
+@dataclass(frozen=True)
 class NetworkSettings:
     moonraker: MoonrakerSettings
     web: WebSettings
+    claw: ClawSettings
 
 
 @dataclass(frozen=True)
@@ -137,6 +143,7 @@ def load_settings(config_dir: Path) -> ControllerSettings:
             port=int(network_data["web"]["port"]),
             title=str(network_data["web"]["title"]),
         ),
+        claw=ClawSettings(usb_cdc_device=Path(str(network_data["claw"]["usb_cdc_device"]))),
     )
     return ControllerSettings(rack=rack, yaw=yaw, camera=camera, network=network)
 
