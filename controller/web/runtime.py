@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import math
 import uuid
 from copy import deepcopy
 from datetime import datetime, timezone
@@ -8,15 +9,14 @@ from importlib.metadata import PackageNotFoundError, version
 from typing import Any, Protocol
 
 from controller.config.settings import ControllerSettings
-from controller.motion.claw_client import ClawCommunicationError, ClawUsbCdcClient
 from controller.motion.klipper_client import KlipperMotionClient
 from controller.network.moonraker import MoonrakerClient, MoonrakerResponse
+from controller.vision.camera_preview import CameraPreviewService
 from controller.workflow.state_machine import ScanStep, TubeScanWorkflow
 from controller.web.events import EventStore, utc_timestamp
 
 _ACTIVE_STATES = {"starting", "running", "paused", "stopping"}
 _TERMINAL_STATES = {"idle", "stopped", "completed", "failed"}
-_REQUIRED_MACROS = ("TUBE_PICKUP", "TUBE_RELEASE", "TUBE_SET_YAW")
 
 
 class QrBackend(Protocol):
@@ -45,22 +45,21 @@ class WorkflowRuntime:
         self,
         settings: ControllerSettings,
         moonraker: MoonrakerClient | None = None,
-        claw: ClawUsbCdcClient | None = None,
         events: EventStore | None = None,
         qr_backend: QrBackend | None = None,
-        macros_available: bool = False,
     ) -> None:
         self.settings = settings
         self.moonraker = moonraker or MoonrakerClient(settings.network.moonraker)
-        self.claw = claw or ClawUsbCdcClient(settings.network.claw.usb_cdc_device)
         self.events = events or EventStore()
         self.qr_backend = qr_backend
-        self.macros_available = macros_available
         self.motion = KlipperMotionClient()
         self.workflow_builder = TubeScanWorkflow(settings)
         self._lock = asyncio.Lock()
-        self._claw_lock = asyncio.Lock()
         self._manual_macro_lock = asyncio.Lock()
+        self._hardware_lock = asyncio.Lock()
+        self._hardware_initialized = False
+        self._debug_pickup: dict[str, Any] | None = None
+        self._debug_pickup_lock = asyncio.Lock()
         self._pause_gate = asyncio.Event()
         self._pause_gate.set()
         self._stop_requested = asyncio.Event()
@@ -75,6 +74,10 @@ class WorkflowRuntime:
         }
         self._workflow = self._empty_workflow()
         self._tubes = self._new_tubes()
+
+    @property
+    def debug_pickup_active(self) -> bool:
+        return bool(self._debug_pickup and self._debug_pickup["state"] in {"running", "failed"})
 
     async def initialize(self) -> None:
         await self.refresh_machine()
@@ -103,6 +106,7 @@ class WorkflowRuntime:
                     position_mm=None,
                     homed_axes=[],
                 )
+                self._hardware_initialized = False
                 if changed:
                     self.events.publish(
                         f"Moonraker connection failed: {response.error_message or 'unavailable'}",
@@ -117,7 +121,31 @@ class WorkflowRuntime:
                     klipper_state=state,
                     state_message=str(result.get("state_message", "Printer information received.")),
                 )
+                if state != "ready":
+                    self._hardware_initialized = False
+        if response.ok and self._machine["klipper_state"] == "ready":
+            await self._initialize_tooling()
         self._broadcast_status()
+
+    async def _initialize_tooling(self) -> None:
+        async with self._hardware_lock:
+            if self._hardware_initialized or not self._machine["connected"] or self._machine["klipper_state"] != "ready":
+                return
+            script = self.motion.initialize_tooling_command()
+            try:
+                response = await asyncio.to_thread(self.moonraker.send_gcode, script)
+            except Exception as exc:
+                response = MoonrakerResponse(False, 0, error_message=str(exc))
+            if not response.ok:
+                self.events.publish(
+                    response.error_message or "Tooling initialization failed.",
+                    source="klipper",
+                    level="error",
+                    command=script,
+                )
+                return
+            self._hardware_initialized = True
+            self.events.publish("Solenoid and vacuum pump initialized off.", source="klipper", command=script)
 
     async def snapshot(self) -> dict[str, Any]:
         async with self._lock:
@@ -126,18 +154,20 @@ class WorkflowRuntime:
             tubes = deepcopy(self._tubes)
         issues = self._readiness_issues(machine)
         active = workflow["state"] in _ACTIVE_STATES
+        debug_active = self.debug_pickup_active
         ready = not issues
         blocking_issues = [issue for issue in issues if not issue.get("overridable", False)]
         degraded_available = bool(issues) and not blocking_issues
         capabilities = {
-            "home": machine["klipper_state"] == "ready" and workflow["state"] in _TERMINAL_STATES,
+            "home": machine["klipper_state"] == "ready" and workflow["state"] in _TERMINAL_STATES and not debug_active,
             "preview": not active,
-            "start": not blocking_issues and not active and bool(tubes),
+            "start": not blocking_issues and not active and not debug_active and bool(tubes),
             "pause": workflow["state"] == "running",
             "resume": workflow["state"] == "paused",
             "stop": workflow["state"] in _ACTIVE_STATES,
-            "send_gcode": machine["klipper_state"] == "ready" and not active,
-            "claw": True,
+            "send_gcode": machine["klipper_state"] == "ready" and not active and not debug_active,
+            "tooling": machine["klipper_state"] == "ready" and workflow["state"] in _TERMINAL_STATES and not debug_active,
+            "camera_pickup_stepper": machine["klipper_state"] == "ready" and not active,
             "qr": self.qr_backend is not None,
             "degraded_mode": degraded_available,
         }
@@ -152,10 +182,18 @@ class WorkflowRuntime:
             },
             "machine": machine,
             "workflow": workflow,
+            "camera_pickup": deepcopy(self._debug_pickup_payload()) if self._debug_pickup else None,
             "rack": {
                 "rows": self.settings.rack.rows,
                 "columns": self.settings.rack.columns,
                 "safe_z_mm": self.settings.rack.safe_z_mm,
+                "camera_offset_mm": {
+                    "x": self.settings.rack.camera_offset_mm.x,
+                    "y": self.settings.rack.camera_offset_mm.y,
+                    "z": self.settings.rack.camera_offset_mm.z,
+                },
+                "pixel_to_mm_multiplier": self.settings.rack.pixel_to_mm_multiplier,
+                "pickup_height_mm": self.settings.rack.pickup_height_mm,
                 "tubes": tubes,
             },
             "capabilities": capabilities,
@@ -191,23 +229,230 @@ class WorkflowRuntime:
             raise RuntimeUnavailable("Klipper must be ready and the workflow inactive to send G-code.")
         return await self._send_action("gcode.send", script, source="user")
 
-    async def claw_open(self) -> dict[str, Any]:
-        return await self._send_claw_action("claw.open", self.claw.open)
+    async def release_tube(self) -> dict[str, Any]:
+        return await self._send_action("tooling.release", self.motion.release_command(), source="klipper")
 
-    async def claw_close(self) -> dict[str, Any]:
-        return await self._send_claw_action("claw.close", self.claw.close)
+    async def start_vacuum(self) -> dict[str, Any]:
+        return await self._send_action("tooling.vacuum", self.motion.pickup_command(), source="klipper")
 
-    async def claw_calibrate(self) -> dict[str, Any]:
-        return await self._send_claw_action("claw.calibrate", self.claw.calibrate)
+    async def stop_vacuum(self) -> dict[str, Any]:
+        return await self._send_action("tooling.vacuum_off", self.motion.vacuum_off_command(), source="klipper")
 
-    async def claw_turn_to_position(self, degrees: int) -> dict[str, Any]:
-        return await self._send_claw_action(
-            "claw.turn",
-            lambda: self.claw.turn_to_position(degrees),
-            message=f"Claw turn to {degrees}° command accepted.",
+    async def zero_rotary(self) -> dict[str, Any]:
+        return await self._send_action("tooling.rotary.zero", self.motion.set_rotary_position_command(), source="klipper")
+
+    async def rotate_to_position(self, degrees: int) -> dict[str, Any]:
+        if isinstance(degrees, bool) or not isinstance(degrees, int):
+            raise ValueError("degrees must be an integer")
+        return await self._send_action(
+            "tooling.rotary.move",
+            self.motion.set_yaw_command(degrees),
+            source="klipper",
         )
 
-    async def calibrate_claw_macro(self) -> dict[str, Any]:
+    async def begin_camera_pickup(
+        self,
+        row: int,
+        column: int,
+        camera_preview: CameraPreviewService,
+    ) -> dict[str, Any]:
+        if isinstance(row, bool) or not isinstance(row, int) or not 1 <= row <= self.settings.rack.rows:
+            raise ValueError("row is outside rack bounds")
+        if isinstance(column, bool) or not isinstance(column, int) or not 1 <= column <= self.settings.rack.columns:
+            raise ValueError("column is outside rack bounds")
+        multiplier = self.settings.rack.pixel_to_mm_multiplier
+        if not 0 < multiplier <= 1:
+            raise RuntimeUnavailable("rack.json pixel_to_mm_multiplier must be greater than 0 and at most 1 mm per pixel.")
+        pickup_height = self.settings.rack.pickup_height_mm
+        safe_z = self.settings.rack.safe_z_mm
+        if not math.isfinite(pickup_height) or not math.isfinite(safe_z) or pickup_height >= safe_z:
+            raise RuntimeUnavailable("rack.json pickup_height_mm must be finite and below safe_z_mm.")
+        snapshot = await self.snapshot()
+        if not snapshot["capabilities"]["send_gcode"]:
+            raise RuntimeUnavailable("Klipper must be ready and the workflow inactive before locating a tube.")
+
+        async with self._debug_pickup_lock:
+            if self.debug_pickup_active:
+                raise RuntimeConflict("A camera-guided pickup is already in progress.")
+            was_running = camera_preview.status()["state"] not in {"not_started", "stopped"}
+            started_by_session = not was_running
+            if started_by_session:
+                await asyncio.to_thread(camera_preview.start)
+            _, frame = await asyncio.to_thread(camera_preview.wait_for_frame, -1, 8.0)
+            if frame is None:
+                if started_by_session:
+                    await asyncio.to_thread(camera_preview.stop)
+                raise RuntimeUnavailable("Camera did not provide a frame; check the camera connection and permissions.")
+
+            tube = self.settings.rack.tube_position(row - 1, column - 1)
+            offset = self.settings.rack.camera_offset_mm
+            camera_x = tube.x - offset.x
+            camera_y = tube.y - offset.y
+            target = {"x": None, "y": None}
+            steps = [
+                {"label": f"Raise to safe Z={safe_z:.2f} mm", "command": self.motion.synchronized_move_command(z=safe_z, feedrate=10000), "state": "pending"},
+                {"label": f"Move camera to X={camera_x:.2f} Y={camera_y:.2f} mm", "command": self.motion.synchronized_move_command(x=camera_x, y=camera_y, feedrate=10000), "state": "pending"},
+                {"label": "Scan camera ROI for fresh tube-center detection", "command": "CAMERA_DETECT", "state": "pending"},
+                {"label": "Move gripper to corrected XY at safe Z", "command": "WAITING_FOR_DETECTION", "state": "pending"},
+                {"label": "Turn vacuum on", "command": self.motion.pickup_command(), "state": "pending"},
+                {"label": f"Lower to pickup Z={pickup_height:.2f} mm", "command": self.motion.synchronized_move_command(z=pickup_height, feedrate=3000), "state": "pending"},
+                {"label": f"Lift to safe Z={safe_z:.2f} mm with vacuum maintained", "command": self.motion.synchronized_move_command(z=safe_z, feedrate=5000), "state": "pending"},
+            ]
+            self._debug_pickup = {
+                "id": f"pickup_{uuid.uuid4().hex}",
+                "correlation_id": f"req_{uuid.uuid4().hex}",
+                "row": row,
+                "column": column,
+                "state": "running",
+                "next_step": 0,
+                "steps": steps,
+                "tube_xy": {"x": tube.x, "y": tube.y},
+                "camera_xy": {"x": camera_x, "y": camera_y},
+                "target_xy": target,
+                "detection_sequence": None,
+                "detected_center_px": None,
+                "correction_mm": None,
+                "pickup_height_mm": pickup_height,
+                "safe_z_mm": safe_z,
+                "current_z": None,
+                "vacuum_enabled": False,
+                "camera_started_by_session": started_by_session,
+            }
+            self.events.publish(
+                f"Camera-guided pickup {self._debug_pickup['id']} is ready. Review the plan, then run one step at a time.",
+                source="camera",
+                correlation_id=self._debug_pickup["correlation_id"],
+            )
+            self._broadcast_status()
+            return self._debug_pickup_payload()
+
+    async def run_camera_pickup_step(self, session_id: str, camera_preview: CameraPreviewService) -> dict[str, Any]:
+        async with self._debug_pickup_lock:
+            session = self._require_debug_pickup(session_id)
+            if session["state"] != "running":
+                raise RuntimeConflict(f"Camera-guided pickup is {session['state']}.")
+            index = session["next_step"]
+            if index >= len(session["steps"]):
+                raise RuntimeConflict("Camera-guided pickup has no remaining steps.")
+
+            step = session["steps"][index]
+            correlation_id = session["correlation_id"]
+            try:
+                if index == 2:
+                    step["state"] = "running"
+                    detection = await asyncio.to_thread(
+                        camera_preview.wait_for_detection,
+                        session["detection_sequence"],
+                        8.0,
+                    )
+                    if detection is None:
+                        raise RuntimeUnavailable("No tube center detected in the camera ROI; no gripper correction or pickup was made.")
+                    center = detection["detected_center"]
+                    roi = detection["roi"]
+                    correction_x = (center[0] - roi["center_x"]) * self.settings.rack.pixel_to_mm_multiplier
+                    correction_y = (center[1] - roi["center_y"]) * self.settings.rack.pixel_to_mm_multiplier
+                    target_x = session["tube_xy"]["x"] + correction_x
+                    target_y = session["tube_xy"]["y"] + correction_y
+                    session["target_xy"] = {"x": target_x, "y": target_y}
+                    session["detected_center_px"] = center
+                    session["correction_mm"] = {"x": correction_x, "y": correction_y}
+                    next_step = session["steps"][3]
+                    next_step["command"] = self.motion.synchronized_move_command(x=target_x, y=target_y, feedrate=5000)
+                    next_step["label"] = f"Move gripper to corrected X={target_x:.2f} Y={target_y:.2f} mm at safe Z"
+                    self.events.publish(
+                        f"Detected center px=({center[0]}, {center[1]}); correction X={correction_x:.2f} Y={correction_y:.2f} mm; gripper target X={target_x:.2f} Y={target_y:.2f} mm.",
+                        source="camera",
+                        correlation_id=correlation_id,
+                    )
+                else:
+                    step["state"] = "running"
+                    command = step["command"]
+                    self.events.publish(
+                        f"Camera pickup step {index + 1}/{len(session['steps'])}: {step['label']} | {command.replace(chr(10), ' ; ') }",
+                        source="camera",
+                        command=command,
+                        correlation_id=correlation_id,
+                    )
+                    await self._send_macro_gcode(command, correlation_id)
+                    if index == 0:
+                        session["current_z"] = session["safe_z_mm"]
+                    elif index == 1:
+                        session["detection_sequence"] = camera_preview.status()["sequence"]
+                    elif index == 4:
+                        session["vacuum_enabled"] = True
+                    elif index == 5:
+                        session["current_z"] = session["pickup_height_mm"]
+                    elif index == 6:
+                        session["current_z"] = session["safe_z_mm"]
+
+                step["state"] = "completed"
+                session["next_step"] += 1
+                if session["next_step"] == len(session["steps"]):
+                    session["state"] = "completed"
+                    self.events.publish(
+                        "Pickup step-through complete; vacuum remains on.",
+                        source="camera",
+                        correlation_id=correlation_id,
+                    )
+                    if session["camera_started_by_session"]:
+                        await asyncio.to_thread(camera_preview.stop)
+                self._broadcast_status()
+                return self._debug_pickup_payload()
+            except Exception:
+                step["state"] = "failed"
+                session["state"] = "failed"
+                if index in {0, 5, 6}:
+                    session["current_z"] = None
+                self._broadcast_status()
+                raise
+
+    async def cancel_camera_pickup(self, session_id: str, camera_preview: CameraPreviewService) -> dict[str, Any]:
+        async with self._debug_pickup_lock:
+            session = self._require_debug_pickup(session_id)
+            if session["state"] not in {"running", "failed"}:
+                raise RuntimeConflict(f"Camera-guided pickup is {session['state']}.")
+            if session["vacuum_enabled"] and (
+                session["current_z"] is None or session["current_z"] < session["safe_z_mm"]
+            ):
+                command = self.motion.synchronized_move_command(z=session["safe_z_mm"], feedrate=5000)
+                await self._send_macro_gcode(command, session["correlation_id"])
+                session["current_z"] = session["safe_z_mm"]
+                self.events.publish("Cancel raised the held tube to safe Z; vacuum remains on.", source="camera", command=command, correlation_id=session["correlation_id"])
+            session["state"] = "cancelled"
+            if session["camera_started_by_session"]:
+                await asyncio.to_thread(camera_preview.stop)
+            self._broadcast_status()
+            return self._debug_pickup_payload()
+
+    def _require_debug_pickup(self, session_id: str) -> dict[str, Any]:
+        session = self._debug_pickup
+        if not session or session["id"] != session_id:
+            raise RuntimeConflict("Camera-guided pickup session was not found.")
+        return session
+
+    def _debug_pickup_payload(self) -> dict[str, Any]:
+        session = self._debug_pickup
+        assert session is not None
+        return {
+            "ok": True,
+            "action": "camera.pickup.stepper",
+            "session_id": session["id"],
+            "state": session["state"],
+            "row": session["row"],
+            "column": session["column"],
+            "next_step": session["next_step"],
+            "steps": [dict(step) for step in session["steps"]],
+            "camera_xy": dict(session["camera_xy"]),
+            "tube_xy": dict(session["tube_xy"]),
+            "target_xy": dict(session["target_xy"]),
+            "detected_center_px": session["detected_center_px"],
+            "correction_mm": dict(session["correction_mm"]) if session["correction_mm"] else None,
+            "pickup_height_mm": session["pickup_height_mm"],
+            "safe_z_mm": session["safe_z_mm"],
+            "vacuum_enabled": session["vacuum_enabled"],
+        }
+
+    async def calibrate_rotary_macro(self) -> dict[str, Any]:
         return await self._run_manual_macro(
             "macro.calibrate",
             "Calibration macro completed.",
@@ -217,7 +462,7 @@ class WorkflowRuntime:
                 ("gcode", self.motion.synchronized_move_command(y=0, feedrate=15000)),
                 ("gcode", self.motion.synchronized_move_command(z=0, feedrate=10000)),
                 ("gcode", self.motion.synchronized_move_command(x=239, feedrate=1800)),
-                ("claw", self.claw.calibrate),
+                ("gcode", self.motion.set_rotary_position_command()),
                 ("gcode", self.motion.synchronized_move_command(z=100, feedrate=15000)),
             ),
         )
@@ -227,9 +472,9 @@ class WorkflowRuntime:
             "macro.pickup",
             "Pickup macro completed.",
             (
-                ("claw", self.claw.open),
+                ("gcode", self.motion.release_command()),
                 ("gcode", self.motion.synchronized_move_command(z=0, feedrate=10000)),
-                ("claw", self.claw.close),
+                ("gcode", self.motion.pickup_command()),
                 ("gcode", self.motion.synchronized_move_command(z=150, feedrate=10000)),
             ),
         )
@@ -240,7 +485,7 @@ class WorkflowRuntime:
             "Deposit macro completed.",
             (
                 ("gcode", self.motion.synchronized_move_command(z=20, feedrate=10000)),
-                ("claw", self.claw.open),
+                ("gcode", self.motion.release_command()),
                 ("gcode", self.motion.synchronized_move_command(z=50, feedrate=10000)),
             ),
         )
@@ -254,6 +499,8 @@ class WorkflowRuntime:
         async with self._lock:
             if self._task and not self._task.done():
                 raise RuntimeConflict("A workflow is already running.")
+            if self.debug_pickup_active:
+                raise RuntimeConflict("A camera-guided pickup step-through is active.")
             issues = self._readiness_issues(self._machine)
             blocking = [issue for issue in issues if not issue.get("overridable", False)]
             if blocking or (issues and not degraded_mode):
@@ -279,7 +526,7 @@ class WorkflowRuntime:
         self.events.publish(f"Scan started for {len(selected_set)} tubes.", source="workflow", correlation_id=workflow_id)
         if degraded_mode:
             self.events.publish(
-                "Degraded mode enabled: pickup, QR/yaw, and release macro steps will be simulated without sending commands.",
+                "Degraded mode enabled: physical pickup and release remain active; QR and rotary scan steps are skipped.",
                 source="workflow",
                 level="warning",
                 correlation_id=workflow_id,
@@ -336,7 +583,7 @@ class WorkflowRuntime:
                 if self._stop_requested.is_set():
                     break
                 await self._before_step(step, index, len(plan))
-                if degraded_mode and self._phase_for(step) in {"pickup", "scan", "release"}:
+                if degraded_mode and self._phase_for(step) == "scan":
                     response = MoonrakerResponse(True, 204)
                 else:
                     response = await asyncio.to_thread(self.moonraker.send_gcode, self._command_for(step))
@@ -357,8 +604,27 @@ class WorkflowRuntime:
             await self._mark_failure(str(exc))
             self.events.publish(f"Scan failed: {exc}", source="workflow", level="error", correlation_id=workflow_id)
         finally:
+            await self._ensure_tooling_off(workflow_id)
             self._held_tube = False
             self._broadcast_status()
+
+    async def _ensure_tooling_off(self, workflow_id: str) -> None:
+        if self._machine["klipper_state"] != "ready":
+            return
+        script = self.motion.shutdown_tooling_command()
+        try:
+            response = await asyncio.to_thread(self.moonraker.send_gcode, script)
+        except Exception as exc:
+            response = MoonrakerResponse(False, 0, error_message=str(exc))
+        if not response.ok:
+            self.events.publish(
+                response.error_message or "Could not switch the vacuum pump and solenoid off.",
+                source="klipper",
+                level="warning",
+                correlation_id=workflow_id,
+            )
+        else:
+            self.events.publish("Vacuum pump and solenoid switched off after workflow.", source="klipper", command=script, correlation_id=workflow_id)
 
     async def _cooperative_pause(self, workflow_id: str) -> None:
         if self._pause_gate.is_set():
@@ -421,6 +687,8 @@ class WorkflowRuntime:
                     tube["status"] = "stopped"
 
     async def _send_action(self, action: str, script: str, source: str) -> dict[str, Any]:
+        if self.debug_pickup_active:
+            raise RuntimeConflict("Machine controls are locked while a camera-guided pickup is being stepped.")
         correlation_id = f"req_{uuid.uuid4().hex}"
         self.events.publish(script, source=source, command=script, correlation_id=correlation_id)
         try:
@@ -434,43 +702,21 @@ class WorkflowRuntime:
         self.events.publish("Command accepted by Moonraker.", source="moonraker", correlation_id=correlation_id)
         return self._action(action, "Command accepted.")
 
-    async def _send_claw_action(
-        self,
-        action: str,
-        command_sender: Any,
-        *,
-        message: str = "Claw command accepted.",
-    ) -> dict[str, Any]:
-        correlation_id = f"req_{uuid.uuid4().hex}"
-        async with self._claw_lock:
-            try:
-                command = await asyncio.to_thread(command_sender)
-            except (ClawCommunicationError, ValueError) as exc:
-                self.events.publish(str(exc), source="claw", level="error", correlation_id=correlation_id)
-                raise RuntimeUnavailable(str(exc)) from exc
-            except Exception as exc:  # defensive boundary around hardware adapter
-                self.events.publish(f"Claw command failed: {exc}", source="claw", level="error", correlation_id=correlation_id)
-                raise RuntimeUnavailable("Unable to send the claw command.") from exc
-        self.events.publish(f"USB CDC command sent: {command}", source="claw", command=command, correlation_id=correlation_id)
-        return self._action(action, message)
-
     async def _run_manual_macro(
         self,
         action: str,
         message: str,
-        steps: tuple[tuple[str, Any], ...],
+        steps: tuple[tuple[str, str], ...],
     ) -> dict[str, Any]:
         snapshot = await self.snapshot()
         if not snapshot["capabilities"]["send_gcode"]:
-            raise RuntimeUnavailable("Klipper must be ready and the workflow inactive before running a claw macro.")
+            raise RuntimeUnavailable("Klipper must be ready and the workflow inactive before running a tooling macro.")
         correlation_id = f"req_{uuid.uuid4().hex}"
         async with self._manual_macro_lock:
             self.events.publish(f"Starting {action}.", source="user", correlation_id=correlation_id)
             for kind, value in steps:
                 if kind == "gcode":
                     await self._send_macro_gcode(value, correlation_id)
-                elif kind == "claw":
-                    await self._send_macro_claw(value, correlation_id)
                 else:  # defensive validation for internal macro definitions
                     raise RuntimeError(f"Unknown manual macro step type: {kind}")
         self.events.publish(message, source="controller", correlation_id=correlation_id)
@@ -487,18 +733,6 @@ class WorkflowRuntime:
             self.events.publish(message, source="moonraker", level="error", correlation_id=correlation_id)
             raise RuntimeUnavailable(message)
         self.events.publish("Macro motion completed.", source="moonraker", correlation_id=correlation_id)
-
-    async def _send_macro_claw(self, command_sender: Any, correlation_id: str) -> None:
-        async with self._claw_lock:
-            try:
-                command = await asyncio.to_thread(command_sender)
-            except (ClawCommunicationError, ValueError) as exc:
-                self.events.publish(str(exc), source="claw", level="error", correlation_id=correlation_id)
-                raise RuntimeUnavailable(str(exc)) from exc
-            except Exception as exc:  # defensive boundary around hardware adapter
-                self.events.publish(f"Claw command failed: {exc}", source="claw", level="error", correlation_id=correlation_id)
-                raise RuntimeUnavailable("Unable to send the claw command.") from exc
-        self.events.publish(f"USB CDC command sent: {command}", source="claw", command=command, correlation_id=correlation_id)
 
     def _command_for(self, step: ScanStep) -> str:
         if step.name == "home":
@@ -579,8 +813,6 @@ class WorkflowRuntime:
             issues.append({"level": "error", "code": "moonraker_offline", "message": "Moonraker is offline.", "overridable": False})
         elif machine["klipper_state"] != "ready":
             issues.append({"level": "error", "code": "klipper_not_ready", "message": "Klipper is not ready.", "overridable": False})
-        if not self.macros_available:
-            issues.append({"level": "warning", "code": "missing_klipper_macro", "message": f"Required macros are not verified: {', '.join(_REQUIRED_MACROS)}. Degraded mode can skip these steps.", "overridable": True})
         if self.qr_backend is None:
             issues.append({"level": "warning", "code": "qr_backend_unavailable", "message": "Camera/QR acquisition is unavailable. Degraded mode can record no-decode results without camera work.", "overridable": True})
         return issues

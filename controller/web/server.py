@@ -8,6 +8,7 @@ from typing import Any, Awaitable, Callable
 from aiohttp import WSMsgType, web
 
 from controller.config.settings import ControllerSettings
+from controller.vision.camera_preview import CameraPreviewService
 from controller.web.events import EventStore, utc_timestamp
 from controller.web.runtime import RuntimeConflict, RuntimeUnavailable, WorkflowRuntime
 
@@ -19,25 +20,35 @@ def create_control_app(
     settings: ControllerSettings,
     *,
     runtime: WorkflowRuntime | None = None,
+    camera_preview: CameraPreviewService | None = None,
     initialize_hardware: bool = True,
 ) -> web.Application:
     events = runtime.events if runtime else EventStore()
     controller = runtime or WorkflowRuntime(settings, events=events)
+    preview = camera_preview or CameraPreviewService(settings.camera)
     app = web.Application(client_max_size=_MAX_BODY, middlewares=[_error_middleware])
     app["settings"] = settings
     app["runtime"] = controller
+    app["camera_preview"] = preview
     app["events"] = events
     app["initialize_hardware"] = initialize_hardware
     app["background_tasks"] = set()
 
     app.router.add_get("/", _index)
     app.router.add_get("/api/status", _status)
+    app.router.add_get("/api/camera/status", _camera_status)
+    app.router.add_get("/api/camera/stream", _camera_stream)
+    app.router.add_post("/api/camera/preview", _camera_preview_toggle)
     app.router.add_post("/api/actions/home", _home)
     app.router.add_post("/api/actions/preview", _preview)
-    app.router.add_post("/api/claw/open", _claw_open)
-    app.router.add_post("/api/claw/close", _claw_close)
-    app.router.add_post("/api/claw/calibrate", _claw_calibrate)
-    app.router.add_post("/api/claw/turn", _claw_turn)
+    app.router.add_post("/api/actions/locate-tube", _locate_tube)
+    app.router.add_post("/api/actions/locate-tube/step", _locate_tube_step)
+    app.router.add_post("/api/actions/locate-tube/cancel", _cancel_locate_tube)
+    app.router.add_post("/api/tooling/release", _tooling_release)
+    app.router.add_post("/api/tooling/vacuum", _tooling_vacuum)
+    app.router.add_post("/api/tooling/vacuum/off", _tooling_vacuum_off)
+    app.router.add_post("/api/tooling/rotary/zero", _rotary_zero)
+    app.router.add_post("/api/tooling/rotary/move", _rotary_move)
     app.router.add_post("/api/macros/calibrate", _macro_calibrate)
     app.router.add_post("/api/macros/pickup", _macro_pickup)
     app.router.add_post("/api/macros/deposit", _macro_deposit)
@@ -94,6 +105,7 @@ async def _on_startup(app: web.Application) -> None:
 
 
 async def _on_cleanup(app: web.Application) -> None:
+    await asyncio.to_thread(app["camera_preview"].stop)
     await app["runtime"].close()
     tasks = list(app["background_tasks"])
     for task in tasks:
@@ -112,6 +124,58 @@ async def _status(request: web.Request) -> web.Response:
     return web.json_response(await request.app["runtime"].snapshot(), headers={"Cache-Control": "no-store"})
 
 
+async def _camera_status(request: web.Request) -> web.Response:
+    return web.json_response(request.app["camera_preview"].status(), headers={"Cache-Control": "no-store"})
+
+
+async def _camera_preview_toggle(request: web.Request) -> web.Response:
+    body = await _json_body(request)
+    enabled = body.get("enabled")
+    if not isinstance(enabled, bool):
+        raise ValueError("enabled must be a boolean")
+    if not enabled and request.app["runtime"].debug_pickup_active:
+        raise RuntimeConflict("Camera preview is needed until the pickup step-through is completed or cancelled.")
+    preview: CameraPreviewService = request.app["camera_preview"]
+    await asyncio.to_thread(preview.start if enabled else preview.stop)
+    return web.json_response({"ok": True, "enabled": enabled, "camera": preview.status()})
+
+
+async def _camera_stream(request: web.Request) -> web.StreamResponse:
+    preview: CameraPreviewService = request.app["camera_preview"]
+    status = preview.status()
+    if status["state"] in {"not_started", "stopped", "stopping"}:
+        return web.json_response(status, status=409, headers={"Cache-Control": "no-store"})
+    if not status["available"]:
+        return web.json_response(status, status=503, headers={"Cache-Control": "no-store"})
+
+    response = web.StreamResponse(
+        status=200,
+        headers={
+            "Content-Type": "multipart/x-mixed-replace; boundary=frame",
+            "Cache-Control": "no-store, no-cache, must-revalidate",
+            "Pragma": "no-cache",
+        },
+    )
+    await response.prepare(request)
+    sequence = 0
+    try:
+        while True:
+            sequence, jpeg = await asyncio.to_thread(preview.wait_for_frame, sequence, 5.0)
+            if jpeg is None:
+                if not preview.status()["available"]:
+                    break
+                continue
+            await response.write(
+                b"--frame\r\nContent-Type: image/jpeg\r\n"
+                + f"Content-Length: {len(jpeg)}\r\n\r\n".encode("ascii")
+                + jpeg
+                + b"\r\n"
+            )
+    except ConnectionResetError:
+        pass
+    return response
+
+
 async def _home(request: web.Request) -> web.Response:
     await _json_body(request, allow_empty=True)
     return web.json_response(await request.app["runtime"].home())
@@ -122,32 +186,80 @@ async def _preview(request: web.Request) -> web.Response:
     return web.json_response(request.app["runtime"].preview())
 
 
-async def _claw_open(request: web.Request) -> web.Response:
+async def _locate_tube(request: web.Request) -> web.Response:
+    body = await _json_body(request)
+    row = body.get("row")
+    column = body.get("column")
+    if isinstance(row, bool) or not isinstance(row, int):
+        raise ValueError("row must be an integer")
+    if isinstance(column, bool) or not isinstance(column, int):
+        raise ValueError("column must be an integer")
+    return web.json_response(
+        await request.app["runtime"].begin_camera_pickup(
+            row,
+            column,
+            request.app["camera_preview"],
+        )
+    )
+
+
+async def _locate_tube_step(request: web.Request) -> web.Response:
+    body = await _json_body(request)
+    session_id = body.get("session_id")
+    if not isinstance(session_id, str) or not session_id:
+        raise ValueError("session_id must be a non-empty string")
+    return web.json_response(
+        await request.app["runtime"].run_camera_pickup_step(
+            session_id,
+            request.app["camera_preview"],
+        )
+    )
+
+
+async def _cancel_locate_tube(request: web.Request) -> web.Response:
+    body = await _json_body(request)
+    session_id = body.get("session_id")
+    if not isinstance(session_id, str) or not session_id:
+        raise ValueError("session_id must be a non-empty string")
+    return web.json_response(
+        await request.app["runtime"].cancel_camera_pickup(
+            session_id,
+            request.app["camera_preview"],
+        )
+    )
+
+
+async def _tooling_release(request: web.Request) -> web.Response:
     await _json_body(request, allow_empty=True)
-    return web.json_response(await request.app["runtime"].claw_open())
+    return web.json_response(await request.app["runtime"].release_tube())
 
 
-async def _claw_close(request: web.Request) -> web.Response:
+async def _tooling_vacuum(request: web.Request) -> web.Response:
     await _json_body(request, allow_empty=True)
-    return web.json_response(await request.app["runtime"].claw_close())
+    return web.json_response(await request.app["runtime"].start_vacuum())
 
 
-async def _claw_calibrate(request: web.Request) -> web.Response:
+async def _tooling_vacuum_off(request: web.Request) -> web.Response:
     await _json_body(request, allow_empty=True)
-    return web.json_response(await request.app["runtime"].claw_calibrate())
+    return web.json_response(await request.app["runtime"].stop_vacuum())
 
 
-async def _claw_turn(request: web.Request) -> web.Response:
+async def _rotary_zero(request: web.Request) -> web.Response:
+    await _json_body(request, allow_empty=True)
+    return web.json_response(await request.app["runtime"].zero_rotary())
+
+
+async def _rotary_move(request: web.Request) -> web.Response:
     body = await _json_body(request)
     degrees = body.get("degrees")
     if isinstance(degrees, bool) or not isinstance(degrees, int):
         raise ValueError("degrees must be an integer")
-    return web.json_response(await request.app["runtime"].claw_turn_to_position(degrees))
+    return web.json_response(await request.app["runtime"].rotate_to_position(degrees))
 
 
 async def _macro_calibrate(request: web.Request) -> web.Response:
     await _json_body(request, allow_empty=True)
-    return web.json_response(await request.app["runtime"].calibrate_claw_macro())
+    return web.json_response(await request.app["runtime"].calibrate_rotary_macro())
 
 
 async def _macro_pickup(request: web.Request) -> web.Response:

@@ -88,21 +88,12 @@ class TubeLocator:
 
 		half_width = (roi_width - 1) / 2.0
 		half_height = (roi_height - 1) / 2.0
-		corners = np.array(
-			[
-				[center_x - half_width, center_y - half_height],
-				[center_x + half_width, center_y - half_height],
-				[center_x + half_width, center_y + half_height],
-				[center_x - half_width, center_y + half_height],
-			],
-			dtype=np.float32,
-		)
 		rotation = cv2.getRotationMatrix2D(
 			(center_x, center_y),
 			self.roi_rotation_deg,
 			1.0,
 		)
-		rotated_corners = cv2.transform(corners[None, :, :], rotation)[0]
+		rotated_corners = self._rotated_roi_corners(roi)
 		destination_corners = np.array(
 			[
 				[0, 0],
@@ -174,26 +165,7 @@ class TubeLocator:
 					)
 
 		if self.show_preview:
-			preview = frame.copy()
-			cv2.polylines(
-				preview,
-				[np.rint(rotated_corners).astype(np.int32)],
-				isClosed=True,
-				color=(255, 0, 0),
-				thickness=2,
-			)
-			if center is not None:
-				cv2.drawMarker(preview, center, (0, 0, 255), cv2.MARKER_CROSS, 20, 2)
-			status = "Tube present" if tube_present else "No tube present"
-			cv2.putText(
-				preview,
-				status,
-				(10, 25),
-				cv2.FONT_HERSHEY_SIMPLEX,
-				0.7,
-				(0, 255, 0) if tube_present else (0, 0, 255),
-				2,
-			)
+			preview = self.annotate(frame, roi, center, tube_present)
 			cv2.imshow(
 				self.preview_window,
 				np.hstack((roi_image, cv2.cvtColor(mask, cv2.COLOR_GRAY2BGR))),
@@ -202,6 +174,60 @@ class TubeLocator:
 			cv2.waitKey(1)
 
 		return center, tube_present
+
+	def annotate(
+		self,
+		frame: np.ndarray,
+		roi: ROI,
+		center: Optional[Point],
+		tube_present: bool,
+	) -> np.ndarray:
+		"""Draw the rotated ROI, its target center, and any detected center."""
+		center_x, center_y, _, _ = roi
+		preview = frame.copy()
+		cv2.polylines(
+			preview,
+			[np.rint(self._rotated_roi_corners(roi)).astype(np.int32)],
+			isClosed=True,
+			color=(255, 120, 30),
+			thickness=2,
+		)
+		cv2.drawMarker(preview, (center_x, center_y), (0, 220, 255), cv2.MARKER_CROSS, 16, 2)
+		if center is not None:
+			cv2.drawMarker(preview, center, (0, 0, 255), cv2.MARKER_CROSS, 20, 2)
+		status = "Tube present" if tube_present else "No tube present"
+		if center is not None:
+			status += f"  center ({center[0]}, {center[1]})"
+		cv2.putText(
+			preview,
+			status,
+			(10, 25),
+			cv2.FONT_HERSHEY_SIMPLEX,
+			0.7,
+			(0, 255, 0) if tube_present else (0, 0, 255),
+			2,
+		)
+		return preview
+
+	def _rotated_roi_corners(self, roi: ROI) -> np.ndarray:
+		center_x, center_y, roi_width, roi_height = roi
+		half_width = (roi_width - 1) / 2.0
+		half_height = (roi_height - 1) / 2.0
+		corners = np.array(
+			[
+				[center_x - half_width, center_y - half_height],
+				[center_x + half_width, center_y - half_height],
+				[center_x + half_width, center_y + half_height],
+				[center_x - half_width, center_y + half_height],
+			],
+			dtype=np.float32,
+		)
+		rotation = cv2.getRotationMatrix2D(
+			(center_x, center_y),
+			self.roi_rotation_deg,
+			1.0,
+		)
+		return cv2.transform(corners[None, :, :], rotation)[0]
 
 	def close(self) -> None:
 		"""Close preview windows."""

@@ -7,7 +7,12 @@ name = "tube-tester"
 version = "0.1.0"
 description = "Test tube scanner robot scaffold for a Klipper gantry"
 requires-python = ">=3.11"
-dependencies = ["aiohttp>=3.9,<4"]
+dependencies = [
+	"aiohttp>=3.9,<4",
+	"numpy>=1.24,<3",
+	"opencv-python-headless>=4.8,<5; platform_system == 'Linux'",
+	"opencv-python>=4.8,<5; platform_system != 'Linux'",
+]
 
 [project.scripts]
 tube-tester = "controller.main:main"

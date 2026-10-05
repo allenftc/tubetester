@@ -5,12 +5,9 @@ from dataclasses import dataclass
 
 @dataclass(frozen=True)
 class KlipperMotionClient:
-    """Builds the Klipper commands used by the workflow scaffold."""
+    """Builds the Klipper commands used by the scanner hardware."""
 
-    pickup_macro: str = "TUBE_PICKUP"
-    release_macro: str = "TUBE_RELEASE"
-    yaw_macro: str = "TUBE_SET_YAW"
-    safe_z_macro: str = "TUBE_SAFE_Z" 
+    safe_z_macro: str = "TUBE_SAFE_Z"
 
     def home_command(self) -> str:
         return "G28"
@@ -35,13 +32,25 @@ class KlipperMotionClient:
         return " ".join(parts)
 
     def pickup_command(self) -> str:
-        return self.pickup_macro
+        return "SET_PIN PIN=vacuum_pump VALUE=1"
+
+    def vacuum_off_command(self) -> str:
+        return "SET_PIN PIN=vacuum_pump VALUE=0"
 
     def release_command(self) -> str:
-        return self.release_macro
+        return "SET_PIN PIN=solenoid VALUE=1\nG4 P500\nSET_PIN PIN=solenoid VALUE=0\nSET_PIN PIN=vacuum_pump VALUE=0"
 
     def set_yaw_command(self, angle_deg: float) -> str:
-        return f"{self.yaw_macro} ANGLE={angle_deg:.2f}"
+        return f"MANUAL_STEPPER STEPPER=rotary MOVE={angle_deg:.2f}"
+
+    def initialize_tooling_command(self) -> str:
+        return "SET_PIN PIN=solenoid VALUE=0\nSET_PIN PIN=vacuum_pump VALUE=0"
+
+    def shutdown_tooling_command(self) -> str:
+        return "SET_PIN PIN=solenoid VALUE=0\nSET_PIN PIN=vacuum_pump VALUE=0"
+
+    def set_rotary_position_command(self, degrees: float = 0) -> str:
+        return f"MANUAL_STEPPER STEPPER=rotary SET_POSITION={degrees:.2f}"
 
     def synchronized_move_command(
         self,

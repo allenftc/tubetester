@@ -1,5 +1,12 @@
 {
   "device_index": 0,
-  "resolution": {"width": 1280, "height": 720},
-  "qr_library": "opencv"
+  "resolution": {"width": 320, "height": 240},
+  "qr_library": "opencv",
+  "roi": {
+    "center_x": 160,
+    "center_y": 120,
+    "width": 80,
+    "height": 80,
+    "rotation_deg": 45
+  }
 }

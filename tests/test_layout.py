@@ -24,6 +24,10 @@ class LayoutScaffoldTests(unittest.TestCase):
         self.assertTrue(any(step.yaw_angle_deg is not None for step in plan.steps))
         self.assertEqual(settings.network.web.port, 8080)
         self.assertTrue(settings.network.moonraker.base_url.startswith(("http://", "https://")))
+        self.assertGreater(settings.camera.roi_width, 1)
+        self.assertGreater(settings.camera.roi_height, 1)
+        self.assertGreaterEqual(settings.camera.roi_center_x, 0)
+        self.assertGreaterEqual(settings.camera.roi_center_y, 0)
         self.assertEqual(settings.rack.rows * settings.rack.columns, 72)
         self.assertEqual(len(plan.steps), 1153)
 
