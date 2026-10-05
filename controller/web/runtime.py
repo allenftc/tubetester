@@ -351,7 +351,12 @@ class WorkflowRuntime:
         if self._held_tube and self._machine["klipper_state"] == "ready":
             response = await asyncio.to_thread(
                 self.moonraker.send_gcode,
-                f"{self.motion.release_command()}\n{self.motion.move_command(z=self.settings.rack.safe_z_mm, feedrate=10000)}",
+                "\n".join((
+                    self.motion.release_command(),
+                    self.motion.vacuum_pump_command(False),
+                    self.motion.solenoid_command(False),
+                    self.motion.move_command(z=self.settings.rack.safe_z_mm, feedrate=10000),
+                )),
             )
             if not response.ok:
                 self.events.publish("Safe release could not be completed.", source="workflow", level="warning", correlation_id=workflow_id)
@@ -380,11 +385,21 @@ class WorkflowRuntime:
         if step.name.startswith("approach_"):
             return f"{self.motion.move_command(z=self.settings.rack.safe_z_mm, feedrate=10000)}\n{self.motion.move_command(x=step.x_mm, y=step.y_mm, feedrate=10000)}"
         if step.name.startswith("pickup_"):
-            return f"{self.motion.move_command(z=step.z_mm, feedrate=10000)}\n{self.motion.pickup_command()}"
+            return "\n".join((
+                self.motion.move_command(z=step.z_mm, feedrate=10000),
+                self.motion.solenoid_command(True),
+                self.motion.vacuum_pump_command(True),
+                self.motion.pickup_command(),
+            ))
         if step.name.startswith("scan_") and step.yaw_angle_deg is not None:
             return self.motion.set_yaw_command(step.yaw_angle_deg)
         if step.name.startswith("release_"):
-            return f"{self.motion.release_command()}\n{self.motion.move_command(z=self.settings.rack.safe_z_mm, feedrate=10000)}"
+            return "\n".join((
+                self.motion.release_command(),
+                self.motion.vacuum_pump_command(False),
+                self.motion.solenoid_command(False),
+                self.motion.move_command(z=self.settings.rack.safe_z_mm, feedrate=10000),
+            ))
         raise RuntimeError(f"Unknown workflow step: {step.name}")
 
     async def _set_workflow_state(self, state: str) -> None:

@@ -9,6 +9,7 @@ from aiohttp.test_utils import TestClient, TestServer
 
 from controller.config.settings import load_settings
 from controller.network.moonraker import MoonrakerResponse
+from controller.workflow.state_machine import ScanStep
 from controller.web.runtime import RuntimeConflict, WorkflowRuntime
 from controller.web.server import create_control_app
 
@@ -86,6 +87,32 @@ class WebTests(unittest.IsolatedAsyncioTestCase):
 
 
 class RuntimeTests(unittest.IsolatedAsyncioTestCase):
+    def test_pickup_and_release_control_vacuum_outputs(self) -> None:
+        settings = load_settings(Path(__file__).resolve().parents[1] / "calibration")
+        runtime = WorkflowRuntime(settings, moonraker=FakeMoonraker())
+
+        pickup = runtime._command_for(ScanStep("pickup_r1_c1", "Pick up tube", z_mm=12.0))
+        release = runtime._command_for(ScanStep("release_r1_c1", "Release tube"))
+
+        self.assertEqual(
+            pickup.splitlines(),
+            [
+                "G1 Z12.000 F10000",
+                "SET_PIN PIN=solenoid VALUE=1",
+                "SET_PIN PIN=vacuum_pump VALUE=1",
+                "TUBE_PICKUP",
+            ],
+        )
+        self.assertEqual(
+            release.splitlines(),
+            [
+                "TUBE_RELEASE",
+                "SET_PIN PIN=vacuum_pump VALUE=0",
+                "SET_PIN PIN=solenoid VALUE=0",
+                f"G1 Z{settings.rack.safe_z_mm:.3f} F10000",
+            ],
+        )
+
     async def test_background_start_and_duplicate_guard(self) -> None:
         settings = load_settings(Path(__file__).resolve().parents[1] / "calibration")
         moonraker = FakeMoonraker(ready=True, delay=0.04)

@@ -11,6 +11,8 @@ class KlipperMotionClient:
     release_macro: str = "TUBE_RELEASE"
     yaw_macro: str = "TUBE_SET_YAW"
     safe_z_macro: str = "TUBE_SAFE_Z" 
+    vacuum_pump_pin: str = "vacuum_pump"
+    solenoid_pin: str = "solenoid"
 
     def home_command(self) -> str:
         return "G28"
@@ -45,3 +47,13 @@ class KlipperMotionClient:
 
     def safe_z_command(self) -> str:
         return self.safe_z_macro
+
+    def set_pin_command(self, pin_name: str, enabled: bool) -> str:
+        value = int(enabled)
+        return f"SET_PIN PIN={pin_name} VALUE={value}"
+
+    def vacuum_pump_command(self, enabled: bool) -> str:
+        return self.set_pin_command(self.vacuum_pump_pin, enabled)
+
+    def solenoid_command(self, enabled: bool) -> str:
+        return self.set_pin_command(self.solenoid_pin, enabled)
