@@ -1,7 +1,13 @@
 from __future__ import annotations
 
 import argparse
+import os
+import sys
+import threading
+import time
 from pathlib import Path
+
+import cv2
 
 from controller.config.settings import load_settings
 from controller.vision.qr_decoder import QrDecoder
@@ -43,7 +49,36 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Capture one frame, attempt a QR decode, and exit.",
     )
+    parser.add_argument(
+        "--reload",
+        action="store_true",
+        help="Restart automatically when Python or calibration files change.",
+    )
     return parser
+
+
+def _snapshot_watch_files(root: Path) -> dict[str, float]:
+    snapshot: dict[str, float] = {}
+    for path in root.rglob("*"):
+        if not path.is_file():
+            continue
+        if path.suffix not in {".py", ".json"}:
+            continue
+        try:
+            snapshot[str(path)] = path.stat().st_mtime
+        except OSError:
+            continue
+    return snapshot
+
+
+def _start_reload_watcher(root: Path, poll_interval: float = 1.0) -> None:
+    initial_snapshot = _snapshot_watch_files(root)
+    while True:
+        time.sleep(poll_interval)
+        current_snapshot = _snapshot_watch_files(root)
+        if current_snapshot != initial_snapshot:
+            print("Detected source or calibration change. Reloading...")
+            os.execvp(sys.executable, [sys.executable, "-m", "controller.main", *sys.argv[1:]])
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -59,6 +94,14 @@ def main(argv: list[str] | None = None) -> int:
         return 0
 
     if args.serve_web:
+        if args.reload:
+            repo_root = Path(__file__).resolve().parents[1]
+            watcher = threading.Thread(
+                target=_start_reload_watcher,
+                args=(repo_root,),
+                daemon=True,
+            )
+            watcher.start()
         serve_control_server(settings)
         return 0
 
@@ -112,6 +155,7 @@ def main(argv: list[str] | None = None) -> int:
     print("Controller scaffold is loaded.")
     print("Use --dry-run to inspect the planned scan sequence.")
     print("Use --serve-web to start the browser control surface.")
+    print("Use --reload with --serve-web to restart automatically on source or config changes.")
     return 0
 
 

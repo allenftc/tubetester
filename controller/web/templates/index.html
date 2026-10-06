@@ -1,0 +1,196 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="dark light">
+  <title>Tube Tester Control</title>
+  <link rel="stylesheet" href="/static/app.css">
+  <script src="/static/app.js" defer></script>
+</head>
+<body>
+  <div id="stale-banner" class="stale-banner" role="status" hidden>Live connection interrupted. Reconnecting…</div>
+  <main class="shell">
+    <header class="control-card card" aria-labelledby="page-title">
+      <div class="identity-row">
+        <div>
+          <p class="eyebrow">AUTOMATED RACK SCANNER</p>
+          <h1 id="page-title">Tube Tester Control</h1>
+        </div>
+        <div class="status-strip" aria-label="System status">
+          <span id="klipper-chip" class="chip neutral">● Klipper Offline</span>
+          <span id="controller-chip" class="chip neutral">● Controller Idle</span>
+          <span id="position-chip" class="chip neutral">Position Unknown</span>
+        </div>
+      </div>
+      <div class="controls" aria-label="Machine and workflow controls">
+        <div class="control-item">
+          <button id="home-button" title="Home all Klipper axes before scanning." disabled>Home Machine</button>
+          <small>Home all axes</small>
+        </div>
+        <div class="control-item">
+          <button id="preview-button" class="secondary" title="Validate the rack plan without moving hardware." disabled>Preview Run</button>
+          <small>Validate without motion</small>
+        </div>
+        <div class="control-item">
+          <button id="start-button" class="primary" title="Scan every pending tube in rack order." disabled>Start Scan</button>
+          <small>Scan pending tubes</small>
+        </div>
+        <div class="control-item">
+          <button id="pause-button" class="secondary" title="Pause after the active Moonraker command finishes." disabled>Pause</button>
+          <small id="pause-description">Hold safely</small>
+        </div>
+        <div class="control-item">
+          <button id="stop-button" class="danger" title="Stop after the active command; this is not an emergency stop." disabled>Stop</button>
+          <small>End cooperatively</small>
+        </div>
+      </div>
+      <div id="readiness" class="readiness" role="status">Connecting to controller…</div>
+    </header>
+
+    <section class="camera-card card" aria-labelledby="camera-title">
+      <div class="section-heading">
+        <div><p class="eyebrow">LIVE V4L2 CAMERA</p><h2 id="camera-title">Tube locator preview</h2></div>
+        <span id="camera-chip" class="chip neutral">PREVIEW OFF</span>
+      </div>
+      <label for="camera-preview-toggle" style="display:flex;align-items:center;gap:8px;margin-top:14px">
+        <input id="camera-preview-toggle" type="checkbox">
+        Enable live camera preview
+      </label>
+      <img id="camera-stream" alt="Live camera frame with locator ROI and center overlay" hidden style="width:100%;max-height:68vh;aspect-ratio:16/9;object-fit:contain;background:#070b10;border:1px solid var(--border);border-radius:6px;margin-top:16px">
+      <p id="camera-details" class="muted" role="status" style="margin:10px 0 0">Preview is off. Camera capture is stopped.</p>
+    </section>
+
+    <section class="workflow-card card" aria-labelledby="workflow-title">
+      <div class="section-heading">
+        <div><p class="eyebrow">WORKFLOW</p><h2 id="workflow-title">Rack scan</h2></div>
+        <div class="progress-numbers"><strong id="tube-count">0 / 72</strong><span id="percent">0%</span></div>
+      </div>
+      <ol id="phase-stepper" class="stepper" aria-label="Current tube phases">
+        <li data-phase="home"><span>1</span>Home</li>
+        <li data-phase="approach"><span>2</span>Approach</li>
+        <li data-phase="pickup"><span>3</span>Pickup</li>
+        <li data-phase="scan"><span>4</span>Scan</li>
+        <li data-phase="release"><span>5</span>Release</li>
+      </ol>
+      <div class="summary-row">
+        <div>
+          <p id="current-description" class="current-description">Waiting for a scan.</p>
+          <p id="step-count" class="muted">0 of 0 steps</p>
+        </div>
+        <div class="summary-chips">
+          <span id="workflow-chip" class="chip neutral">IDLE</span>
+          <span id="qr-chip" class="chip neutral">QR UNAVAILABLE</span>
+          <span id="coordinate-chip" class="chip neutral">NO TUBE</span>
+        </div>
+      </div>
+      <div class="progress-track" role="progressbar" aria-label="Tube scan progress" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0"><span id="progress-fill"></span></div>
+      <div id="preview-result" class="preview-result" hidden></div>
+
+      <div class="rack-heading">
+        <h3 id="rack-title">Rack 6 × 12</h3>
+        <div class="legend" aria-label="Tube status legend">
+          <span>○ Pending</span><span>◉ Active</span><span>✓ Decoded</span><span>— No decode</span><span>! Failed</span>
+        </div>
+      </div>
+      <div class="rack-scroll" tabindex="0" aria-label="Scrollable rack grid">
+        <div id="rack-grid" class="rack-grid" role="grid" aria-labelledby="rack-title"></div>
+      </div>
+      <div id="tube-details" class="tube-details" aria-live="polite">Select a tube to inspect its calibrated position and result.</div>
+      <div class="controls" style="grid-template-columns:minmax(180px,auto) 1fr;align-items:center;max-width:620px;margin-top:12px">
+        <button id="locate-selected-tube-button" class="secondary" title="Prepare a camera-guided pickup session." disabled>Begin Pickup Steps</button>
+        <button id="run-next-pickup-step-button" class="primary" hidden disabled>Run Next Step</button>
+        <button id="cancel-pickup-steps-button" class="danger" hidden disabled>Cancel Steps</button>
+        <small id="locate-tube-status" class="muted">Home axes first. Select a rack position to preview its camera and gripper coordinates.</small>
+      </div>
+      <p id="locate-tube-plan" class="muted" aria-live="polite">Pickup height is configured by pickup_height_mm in rack.json.</p>
+      <ol id="locate-tube-plan-steps" class="locate-tube-steps"></ol>
+      <ol id="locate-tube-steps" class="locate-tube-steps" aria-live="polite"></ol>
+    </section>
+
+    <section class="macro-card card" aria-labelledby="macro-title">
+      <div class="section-heading">
+        <div><p class="eyebrow">KLIPPER TOOLING</p><h2 id="macro-title">Combined macros</h2></div>
+      </div>
+      <div class="controls macro-controls" aria-label="Combined Klipper and tooling macro controls">
+        <div class="control-item">
+          <button id="macro-calibrate-button" class="secondary" title="Move to the rotary setup position and zero its position." disabled>Calibrate Rotary</button>
+          <small>Move to setup position · set rotary position to 0°</small>
+        </div>
+        <div class="control-item">
+          <button id="macro-pickup-button" class="primary" title="Pulse release, lower to Z0, enable vacuum, then lift to Z150." disabled>Pickup</button>
+          <small>Release · Z0 · vacuum on · Z150</small>
+        </div>
+        <div class="control-item">
+          <button id="macro-deposit-button" class="secondary" title="Move to Z20, pulse the release solenoid, then lift to Z50." disabled>Deposit</button>
+          <small>Z20 · release · Z50</small>
+        </div>
+      </div>
+    </section>
+
+    <section class="tooling-card card" aria-labelledby="tooling-title">
+      <div class="section-heading">
+        <div><p class="eyebrow">KLIPPER CONTROLLED</p><h2 id="tooling-title">Vacuum &amp; rotary</h2></div>
+        <span id="tooling-chip" class="chip neutral">TOOLING UNAVAILABLE</span>
+      </div>
+      <div class="controls tooling-controls" aria-label="Vacuum and rotary controls">
+        <div class="control-item">
+          <button id="tooling-release-button" class="secondary" title="Pulse the release solenoid for 500 ms." disabled>Release Tube</button>
+          <small>Solenoid pulse · 500 ms</small>
+        </div>
+        <div class="control-item">
+          <button id="tooling-vacuum-button" class="secondary" title="Turn on the vacuum pump." disabled>Vacuum On</button>
+          <small>Pump remains active after startup</small>
+        </div>
+        <div class="control-item">
+          <button id="tooling-vacuum-off-button" class="secondary" title="Turn off the vacuum pump." disabled>Vacuum Off</button>
+          <small>Stops the pump</small>
+        </div>
+        <div class="control-item">
+          <button id="tooling-zero-button" class="secondary" title="Set the current rotary position to zero." disabled>Zero Rotary</button>
+        </div>
+        <div class="control-item rotary-control">
+          <label for="rotary-degrees-input">Rotary position (degrees)</label>
+          <div class="inline-control">
+            <input id="rotary-degrees-input" type="number" step="1" inputmode="numeric" autocomplete="off" placeholder="45" disabled>
+            <button id="rotary-move-button" class="secondary" title="Move the rotary stepper to the requested position." disabled>Move</button>
+          </div>
+          <small>Klipper manual stepper: rotary</small>
+        </div>
+      </div>
+    </section>
+
+    <section id="console-card" class="console-card card" aria-labelledby="console-title">
+      <div class="console-header">
+        <div><p class="eyebrow">KLIPPER</p><h2 id="console-title">Console</h2></div>
+        <div class="console-tools">
+          <button id="clear-console" class="icon-button" title="Clear console messages in this browser." aria-label="Clear console">⌫</button>
+          <button id="help-console" class="icon-button" title="Show console syntax and safety guidance." aria-label="Console help" aria-expanded="false">?</button>
+          <button id="settings-console" class="icon-button" title="Filter console messages." aria-label="Console settings" aria-expanded="false">⚙</button>
+          <button id="collapse-console" class="icon-button" title="Collapse or expand the console." aria-label="Collapse console" aria-expanded="true">⌃</button>
+        </div>
+      </div>
+      <div id="help-panel" class="popover" hidden>
+        Enter one line of G-code and press Enter to send it. Arbitrary G-code can move hardware. Errors are red and warnings are amber.
+      </div>
+      <fieldset id="settings-panel" class="popover filter-panel" hidden>
+        <legend>Visible console events</legend>
+        <div id="level-filters"><strong>Levels</strong></div>
+        <div id="source-filters"><strong>Sources</strong></div>
+        <button id="show-history" type="button" class="text-button">Show retained history</button>
+      </fieldset>
+      <div id="console-body">
+        <form id="gcode-form" class="composer">
+          <label class="sr-only" for="gcode-input">Send G-code to Klipper</label>
+          <input id="gcode-input" type="text" maxlength="1000" autocomplete="off" placeholder="Send code…" disabled>
+          <button id="send-button" type="submit" class="primary" disabled>Send</button>
+        </form>
+        <div id="console-log" class="console-log" role="log" aria-live="off" aria-label="Controller console events">
+          <div id="console-empty" class="console-empty">No console messages yet.</div>
+        </div>
+      </div>
+    </section>
+    <div id="announcer" class="sr-only" aria-live="polite"></div>
+  </main>
+</body>
+</html>
