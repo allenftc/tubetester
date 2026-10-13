@@ -11,6 +11,7 @@ import numpy as np
 
 Point = Tuple[int, int]
 ROI = Tuple[int, int, int, int]
+Circle = Tuple[int, int, int]
 
 
 def resize_to_resolution(
@@ -47,8 +48,8 @@ class TubeLocator:
 
 	def __init__(
 		self,
-		lower_hsv: Tuple[int, int, int] = (110, 16, 20),
-		upper_hsv: Tuple[int, int, int] = (120, 255, 255),
+		lower_hsv: Tuple[int, int, int] = (100, 16, 0),
+		upper_hsv: Tuple[int, int, int] = (130, 255, 255),
 		invert_mask: bool = True,
 		min_contour_area: float = 25.0,
 		show_preview: bool = True,
@@ -78,33 +79,25 @@ class TubeLocator:
 		Tube presence is gated by the fraction of foreground pixels in a central
 		patch of the inverted ROI mask.
 		"""
+		center, tube_present, _ = self.locate_with_mask(frame, roi)
+		return center, tube_present
+
+	def locate_with_mask(
+		self,
+		frame: np.ndarray,
+		roi: ROI,
+	) -> Tuple[Optional[Point], bool, Optional[np.ndarray]]:
+		"""Return the detection result and raw HSV threshold mask for the ROI."""
 		if frame is None or frame.size == 0:
-			return None, False
+			return None, False, None
 
 		height, width = frame.shape[:2]
 		center_x, center_y, roi_width, roi_height = roi
 		if roi_width <= 1 or roi_height <= 1:
-			return None, False
+			return None, False, None
 
+		roi_image, warp = self._warp_roi(frame, roi)
 		rotated_corners = self._rotated_roi_corners(roi)
-		destination_corners = np.array(
-			[
-				[0, 0],
-				[roi_width - 1, 0],
-				[roi_width - 1, roi_height - 1],
-				[0, roi_height - 1],
-			],
-			dtype=np.float32,
-		)
-		warp = cv2.getPerspectiveTransform(rotated_corners, destination_corners)
-		roi_image = cv2.warpPerspective(
-			frame,
-			warp,
-			(roi_width, roi_height),
-			flags=cv2.INTER_LINEAR,
-			borderMode=cv2.BORDER_CONSTANT,
-			borderValue=(0, 0, 0),
-		)
 		valid_pixels = cv2.warpPerspective(
 			np.full((height, width), 255, dtype=np.uint8),
 			warp,
@@ -114,7 +107,8 @@ class TubeLocator:
 			borderValue=0,
 		)
 		hsv = cv2.cvtColor(roi_image, cv2.COLOR_BGR2HSV)
-		mask = cv2.inRange(hsv, self.lower_hsv, self.upper_hsv)
+		raw_mask = cv2.inRange(hsv, self.lower_hsv, self.upper_hsv)
+		mask = raw_mask.copy()
 		if self.invert_mask:
 			mask = cv2.bitwise_not(mask)
 		mask = cv2.bitwise_and(mask, valid_pixels)
@@ -166,7 +160,81 @@ class TubeLocator:
 			cv2.imshow(f"{self.preview_window} - frame", preview)
 			cv2.waitKey(1)
 
-		return center, tube_present
+		return center, tube_present, raw_mask
+
+	def locate_with_circles(
+		self,
+		frame: np.ndarray,
+		roi: ROI,
+	) -> Tuple[Optional[Point], bool, Optional[np.ndarray], list[Circle], Optional[np.ndarray]]:
+		"""Detect circles and return a montage of the intermediate OpenCV Mats."""
+		if frame is None or frame.size == 0:
+			return None, False, None, [], None
+
+		center_x, center_y, roi_width, roi_height = roi
+		if roi_width <= 1 or roi_height <= 1:
+			return None, False, None, [], None
+
+		roi_image, warp = self._warp_roi(frame, roi)
+		hsv = cv2.cvtColor(roi_image, cv2.COLOR_BGR2HSV)
+		raw_mask = cv2.inRange(hsv, self.lower_hsv, self.upper_hsv)
+		gray = cv2.cvtColor(roi_image, cv2.COLOR_BGR2GRAY)
+		blurred = cv2.GaussianBlur(gray, (9, 9), 1.5)
+		min_radius = max(2, min(roi_width, roi_height) // 20)
+		detected = cv2.HoughCircles(
+			blurred,
+			cv2.HOUGH_GRADIENT,
+			dp=1,
+			minDist=20,
+			param1=150,
+			param2=35,
+			minRadius=10,
+			maxRadius=0,
+		)
+		circles: list[Circle] = []
+		roi_circles: list[Circle] = []
+		if detected is not None:
+			for x, y, radius in np.rint(detected[0]).astype(int):
+				roi_circles.append((int(x), int(y), int(radius)))
+				roi_circle = np.array([[[float(x), float(y)]]], dtype=np.float32)
+				frame_circle = cv2.perspectiveTransform(roi_circle, np.linalg.inv(warp))[0, 0]
+				circles.append((
+					int(round(float(frame_circle[0]))),
+					int(round(float(frame_circle[1]))),
+					int(radius),
+				))
+
+		center: Optional[Point] = None
+		if circles:
+			center = min(
+				((x, y) for x, y, _ in circles),
+				key=lambda point: (point[0] - center_x) ** 2 + (point[1] - center_y) ** 2,
+			)
+		debug_montage = self._circle_debug_montage(roi_image, gray, blurred, roi_circles)
+		return center, bool(circles), raw_mask, circles, debug_montage
+
+	def roi_offset_from_frame_point(self, point: Point, roi: ROI) -> tuple[float, float]:
+		"""Return a frame point's offset from the ROI center in rotated ROI pixels."""
+		center_x, center_y, roi_width, roi_height = roi
+		rotated_corners = self._rotated_roi_corners(roi)
+		destination_corners = np.array(
+			[
+				[0, 0],
+				[roi_width - 1, 0],
+				[roi_width - 1, roi_height - 1],
+				[0, roi_height - 1],
+			],
+			dtype=np.float32,
+		)
+		warp = cv2.getPerspectiveTransform(rotated_corners, destination_corners)
+		roi_point = cv2.perspectiveTransform(
+			np.array([[[float(point[0]), float(point[1])]]], dtype=np.float32),
+			warp,
+		)[0, 0]
+		return (
+			float(roi_point[0]) - (roi_width - 1) / 2.0,
+			float(roi_point[1]) - (roi_height - 1) / 2.0,
+		)
 
 	def annotate(
 		self,
@@ -174,6 +242,7 @@ class TubeLocator:
 		roi: ROI,
 		center: Optional[Point],
 		tube_present: bool,
+		circles: Optional[list[Circle]] = None,
 	) -> np.ndarray:
 		"""Draw the rotated ROI, its target center, and any detected center."""
 		center_x, center_y, _, _ = roi
@@ -185,6 +254,9 @@ class TubeLocator:
 			color=(255, 120, 30),
 			thickness=2,
 		)
+		for circle_x, circle_y, radius in circles or []:
+			cv2.circle(preview, (circle_x, circle_y), radius, (0, 255, 0), 2)
+			cv2.circle(preview, (circle_x, circle_y), 2, (0, 255, 0), -1)
 		cv2.drawMarker(preview, (center_x, center_y), (0, 220, 255), cv2.MARKER_CROSS, 16, 2)
 		if center is not None:
 			cv2.drawMarker(preview, center, (0, 0, 255), cv2.MARKER_CROSS, 20, 2)
@@ -201,6 +273,58 @@ class TubeLocator:
 			2,
 		)
 		return preview
+
+	def _warp_roi(self, frame: np.ndarray, roi: ROI) -> tuple[np.ndarray, np.ndarray]:
+		_, _, roi_width, roi_height = roi
+		rotated_corners = self._rotated_roi_corners(roi)
+		destination_corners = np.array(
+			[
+				[0, 0],
+				[roi_width - 1, 0],
+				[roi_width - 1, roi_height - 1],
+				[0, roi_height - 1],
+			],
+			dtype=np.float32,
+		)
+		warp = cv2.getPerspectiveTransform(rotated_corners, destination_corners)
+		roi_image = cv2.warpPerspective(
+			frame,
+			warp,
+			(roi_width, roi_height),
+			flags=cv2.INTER_LINEAR,
+			borderMode=cv2.BORDER_CONSTANT,
+			borderValue=(0, 0, 0),
+		)
+		return roi_image, warp
+
+	@staticmethod
+	def _circle_debug_montage(
+		roi_image: np.ndarray,
+		gray: np.ndarray,
+		blurred: np.ndarray,
+		circles: list[Circle],
+	) -> np.ndarray:
+		height, width = gray.shape
+		result = cv2.cvtColor(gray, cv2.COLOR_GRAY2BGR)
+		for x, y, radius in circles:
+			cv2.circle(result, (x, y), radius, (0, 255, 0), 2)
+			cv2.circle(result, (x, y), 2, (0, 255, 0), -1)
+
+		panels = (
+			("Rotated ROI", roi_image),
+			("Grayscale", cv2.cvtColor(gray, cv2.COLOR_GRAY2BGR)),
+			("Gaussian blur (Hough input)", cv2.cvtColor(blurred, cv2.COLOR_GRAY2BGR)),
+			("Hough circles", result),
+		)
+		tile_width = max(1, width * 2)
+		tile_height = max(1, height * 2)
+		tiles: list[np.ndarray] = []
+		for label, image in panels:
+			tile = cv2.resize(image, (tile_width, tile_height), interpolation=cv2.INTER_NEAREST)
+			cv2.rectangle(tile, (0, 0), (tile_width - 1, 20), (0, 0, 0), cv2.FILLED)
+			cv2.putText(tile, label, (5, 15), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 255, 255), 1)
+			tiles.append(tile)
+		return np.vstack((np.hstack(tiles[:2]), np.hstack(tiles[2:])))
 
 	def _rotated_roi_corners(self, roi: ROI) -> np.ndarray:
 		center_x, center_y, roi_width, roi_height = roi
@@ -253,7 +377,7 @@ def main() -> None:
 	parser.add_argument(
 		"--exposure",
 		type=float,
-		default=-4.0,
+		default=40,
 		help="Manual webcam exposure value (default: -4.0; backend-dependent)",
 	)
 	args = parser.parse_args()
@@ -277,7 +401,7 @@ def main() -> None:
 				raise RuntimeError(
 					f"Could not open webcam with index {args.camera_index}"
 				)
-			auto_exposure_set = camera.set(cv2.CAP_PROP_AUTO_EXPOSURE, 0.25)
+			auto_exposure_set = camera.set(cv2.CAP_PROP_AUTO_EXPOSURE, 1)
 			exposure_set = camera.set(cv2.CAP_PROP_EXPOSURE, args.exposure)
 			actual_auto_exposure = camera.get(cv2.CAP_PROP_AUTO_EXPOSURE)
 			actual_exposure = camera.get(cv2.CAP_PROP_EXPOSURE)
@@ -304,7 +428,7 @@ def main() -> None:
 					if not ok:
 						break
 
-					center, tube_present = locator.locate(frame, (160, 120, 100, 100))
+					center, tube_present = locator.locate(frame, (160, 120, 60, 60))
 					print(
 						f"Tube present: {tube_present}; center: {center}",
 						end="\r",
@@ -322,7 +446,7 @@ def main() -> None:
 				raise FileNotFoundError(f"Could not read image: {args.image}")
 
 			frame = resize_to_240p(frame)
-			center, tube_present = locator.locate(frame, (160, 120, 85, 85))
+			center, tube_present = locator.locate(frame, (160, 120, 75, 75))
 			print(f"Tube present: {tube_present}; center: {center}")
 			while True:
 				key = cv2.waitKey(50) & 0xFF

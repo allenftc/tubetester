@@ -41,6 +41,7 @@ class FakeCameraPreview:
     def __init__(self) -> None:
         self.started = False
         self.finished = False
+        self.detection_mode = "hsv"
 
     def status(self) -> dict[str, object]:
         return {
@@ -53,12 +54,25 @@ class FakeCameraPreview:
             "roi": {"center_x": 160, "center_y": 120, "width": 100, "height": 100},
             "detected_center": None,
             "tube_present": False,
+            "detection_mode": self.detection_mode,
             "sequence": 1,
         }
 
     def wait_for_frame(self, after_sequence: int, timeout_seconds: float = 5.0) -> tuple[int, bytes | None]:
         if after_sequence == 0:
             return 1, b"\xff\xd8fake-jpeg\xff\xd9"
+        self.finished = True
+        return 1, None
+
+    def wait_for_mask_frame(self, after_sequence: int, timeout_seconds: float = 5.0) -> tuple[int, bytes | None]:
+        if after_sequence == 0:
+            return 1, b"\xff\xd8fake-mask\xff\xd9"
+        self.finished = True
+        return 1, None
+
+    def wait_for_debug_frame(self, after_sequence: int, timeout_seconds: float = 5.0) -> tuple[int, bytes | None]:
+        if after_sequence == 0:
+            return 1, b"\xff\xd8fake-debug\xff\xd9"
         self.finished = True
         return 1, None
 
@@ -69,6 +83,9 @@ class FakeCameraPreview:
     def stop(self) -> None:
         self.started = False
         self.finished = True
+
+    def set_detection_mode(self, mode: str) -> None:
+        self.detection_mode = mode
 
 
 class FakeDetectionCameraPreview(FakeCameraPreview):
@@ -87,6 +104,24 @@ class FakeDetectionCameraPreview(FakeCameraPreview):
         return {
             "detected_center": self.detected_center,
             "roi": {"center_x": 160, "center_y": 120, "width": 80, "height": 80},
+        }
+
+    def wait_for_hough_detection(
+        self,
+        after_sequence: int,
+        frame_count: int = 10,
+        timeout_seconds: float = 8.0,
+    ) -> dict[str, object] | None:
+        self.detection_after_sequence = after_sequence
+        if self.detected_center is None:
+            return None
+        offset_x = self.detected_center[0] - 160
+        offset_y = self.detected_center[1] - 120
+        return {
+            "detected_center": self.detected_center,
+            "detected_offset_roi": [float(offset_x), float(offset_y)],
+            "roi": {"center_x": 160, "center_y": 120, "width": 80, "height": 80},
+            "sample_count": frame_count,
         }
 
 
@@ -108,6 +143,10 @@ class WebTests(unittest.IsolatedAsyncioTestCase):
             self.assertIn(landmark, html)
         self.assertIn('id="camera-preview-toggle" type="checkbox"', html)
         self.assertIn('id="camera-stream" alt=', html)
+        self.assertIn('id="camera-mask-stream" alt=', html)
+        self.assertIn('id="camera-debug-stream" alt=', html)
+        self.assertIn('id="camera-debug-stream" alt=', html)
+        self.assertIn('id="camera-detection-mode"', html)
         self.assertNotIn('src="/api/camera/stream"', html)
         self.assertIn('id="locate-tube-plan-steps"', html)
         self.assertIn('id="locate-tube-steps"', html)
@@ -123,6 +162,7 @@ class WebTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(status["capabilities"]["degraded_mode"])
         self.assertEqual(len(status["rack"]["tubes"]), 72)
         self.assertEqual(status["rack"]["pickup_height_mm"], self.settings.rack.pickup_height_mm)
+        self.assertEqual(status["rack"]["scan_height_mm"], self.settings.rack.scan_height_mm)
         self.assertNotIn("plan", status["workflow"])
         self.assertNotIn("moonraker", status)
 
@@ -143,6 +183,10 @@ class WebTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(status["roi"]["center_x"], self.settings.camera.roi_center_x)
         stream = await self.client.get("/api/camera/stream")
         self.assertEqual(stream.status, 409)
+        mask = await self.client.get("/api/camera/mask")
+        self.assertEqual(mask.status, 409)
+        debug = await self.client.get("/api/camera/debug")
+        self.assertEqual(debug.status, 409)
 
     async def test_camera_preview_toggle_starts_and_stops_capture(self) -> None:
         preview = FakeCameraPreview()
@@ -166,6 +210,26 @@ class WebTests(unittest.IsolatedAsyncioTestCase):
         finally:
             await client.close()
 
+    async def test_camera_detection_mode_can_be_switched(self) -> None:
+        preview = FakeCameraPreview()
+        client = TestClient(TestServer(create_control_app(
+            self.settings,
+            runtime=self.runtime,
+            camera_preview=preview,
+            initialize_hardware=False,
+        )))
+        await client.start_server()
+        try:
+            response = await client.post("/api/camera/detection-mode", json={"detection_mode": "hough"})
+            self.assertEqual(response.status, 200)
+            self.assertEqual((await response.json())["detection_mode"], "hough")
+            self.assertEqual(preview.status()["detection_mode"], "hough")
+
+            invalid = await client.post("/api/camera/detection-mode", json={"detection_mode": "circle"})
+            self.assertEqual(invalid.status, 400)
+        finally:
+            await client.close()
+
     async def test_camera_stream_emits_multipart_jpeg_frames(self) -> None:
         preview = FakeCameraPreview()
         client = TestClient(TestServer(create_control_app(
@@ -184,6 +248,48 @@ class WebTests(unittest.IsolatedAsyncioTestCase):
             self.assertTrue(response.headers["Content-Type"].startswith("multipart/x-mixed-replace"))
             self.assertIn(b"--frame", body)
             self.assertIn(b"\xff\xd8fake-jpeg\xff\xd9", body)
+        finally:
+            await client.close()
+
+    async def test_camera_mask_stream_emits_multipart_jpeg_frames(self) -> None:
+        preview = FakeCameraPreview()
+        client = TestClient(TestServer(create_control_app(
+            self.settings,
+            runtime=self.runtime,
+            camera_preview=preview,
+            initialize_hardware=False,
+        )))
+        await client.start_server()
+        try:
+            enabled = await client.post("/api/camera/preview", json={"enabled": True})
+            self.assertEqual(enabled.status, 200)
+            response = await client.get("/api/camera/mask")
+            body = await response.read()
+            self.assertEqual(response.status, 200)
+            self.assertTrue(response.headers["Content-Type"].startswith("multipart/x-mixed-replace"))
+            self.assertIn(b"--frame", body)
+            self.assertIn(b"\xff\xd8fake-mask\xff\xd9", body)
+        finally:
+            await client.close()
+
+    async def test_camera_debug_stream_emits_multipart_jpeg_frames(self) -> None:
+        preview = FakeCameraPreview()
+        client = TestClient(TestServer(create_control_app(
+            self.settings,
+            runtime=self.runtime,
+            camera_preview=preview,
+            initialize_hardware=False,
+        )))
+        await client.start_server()
+        try:
+            enabled = await client.post("/api/camera/preview", json={"enabled": True})
+            self.assertEqual(enabled.status, 200)
+            response = await client.get("/api/camera/debug")
+            body = await response.read()
+            self.assertEqual(response.status, 200)
+            self.assertTrue(response.headers["Content-Type"].startswith("multipart/x-mixed-replace"))
+            self.assertIn(b"--frame", body)
+            self.assertIn(b"\xff\xd8fake-debug\xff\xd9", body)
         finally:
             await client.close()
 
@@ -338,7 +444,22 @@ class RuntimeTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(moonraker.commands, [])
         self.assertFalse(camera.started)
 
-    async def test_locate_tube_steps_one_command_per_click_and_keeps_vacuum_on(self) -> None:
+    async def test_locate_tube_rejects_scan_height_below_safe_z_before_motion(self) -> None:
+        settings = load_settings(Path(__file__).resolve().parents[1] / "calibration")
+        settings = replace(settings, rack=replace(settings.rack, scan_height_mm=settings.rack.safe_z_mm - 1))
+        moonraker = FakeMoonraker(ready=True)
+        runtime = WorkflowRuntime(settings, moonraker=moonraker)
+        await runtime.refresh_machine()
+        moonraker.commands.clear()
+        camera = FakeDetectionCameraPreview([160, 120])
+
+        with self.assertRaisesRegex(RuntimeUnavailable, "scan_height_mm must be finite and at or above safe_z_mm"):
+            await runtime.begin_camera_pickup(1, 1, camera)  # type: ignore[arg-type]
+
+        self.assertEqual(moonraker.commands, [])
+        self.assertFalse(camera.started)
+
+    async def test_locate_tube_steps_deposit_at_slot_center_and_turn_vacuum_off(self) -> None:
         settings = load_settings(Path(__file__).resolve().parents[1] / "calibration")
         moonraker = FakeMoonraker(ready=True)
         runtime = WorkflowRuntime(settings, moonraker=moonraker)
@@ -352,7 +473,7 @@ class RuntimeTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(session["next_step"], 0)
         self.assertEqual(moonraker.commands, [])
 
-        for step_index in range(7):
+        for step_index in range(8):
             previous_command_count = len(moonraker.commands)
             session = await runtime.run_camera_pickup_step(session["session_id"], camera)  # type: ignore[arg-type]
             expected_added_commands = 0 if step_index == 2 else 1
@@ -361,21 +482,30 @@ class RuntimeTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(session["action"], "camera.pickup.stepper")
         self.assertEqual(session["state"], "completed")
-        self.assertEqual(session["target_xy"], {
-            "x": tube.x + 10 * settings.rack.pixel_to_mm_multiplier,
-            "y": tube.y - 5 * settings.rack.pixel_to_mm_multiplier,
+        self.assertEqual(session["correction_mm"], {
+            "x": 10 * settings.rack.pixel_to_mm_multiplier,
+            "y": 5 * settings.rack.pixel_to_mm_multiplier,
         })
         self.assertEqual(moonraker.commands, [
             f"G90\nG1 Z{settings.rack.safe_z_mm:.3f} F10000\nM400",
             f"G90\nG1 X{tube.x - settings.rack.camera_offset_mm.x:.3f} Y{tube.y - settings.rack.camera_offset_mm.y:.3f} F10000\nM400",
-            f"G90\nG1 X{session['target_xy']['x']:.3f} Y{session['target_xy']['y']:.3f} F5000\nM400",
+            f"G90\nG1 X{tube.x + 10 * settings.rack.pixel_to_mm_multiplier:.3f} Y{tube.y + 5 * settings.rack.pixel_to_mm_multiplier:.3f} F5000\nM400",
             "SET_PIN PIN=vacuum_pump VALUE=1",
             f"G90\nG1 Z{settings.rack.pickup_height_mm:.3f} F3000\nM400",
-            f"G90\nG1 Z{settings.rack.safe_z_mm:.3f} F5000\nM400",
+            f"G90\nG1 Z{settings.rack.scan_height_mm:.3f} F5000\nM400",
+            "\n".join((
+                f"G90\nG1 X{tube.x:.3f} Y{tube.y:.3f} F5000\nM400",
+                f"G90\nG1 Z{settings.rack.pickup_height_mm:.3f} F3000\nM400",
+                "SET_PIN PIN=solenoid VALUE=1\nG4 P500\nSET_PIN PIN=solenoid VALUE=0",
+                "SET_PIN PIN=vacuum_pump VALUE=0",
+                f"G90\nG1 Z{settings.rack.scan_height_mm:.3f} F5000\nM400",
+            )),
         ])
-        self.assertEqual(len(session["steps"]), 7)
+        self.assertEqual(len(session["steps"]), 8)
+        self.assertEqual(session["scan_height_mm"], settings.rack.scan_height_mm)
         self.assertTrue(all(step["state"] == "completed" for step in session["steps"]))
-        self.assertTrue(session["vacuum_enabled"])
+        self.assertFalse(session["vacuum_enabled"])
+        self.assertEqual(session["target_xy"], {"x": tube.x, "y": tube.y})
         self.assertFalse(camera.started)
 
     async def test_locate_tube_does_not_correct_gripper_without_detection(self) -> None:

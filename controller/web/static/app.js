@@ -52,9 +52,14 @@ async function bootstrap() {
 
 function connectCameraPreview() {
   const image = el("camera-stream");
-  image.addEventListener("error", () => { state.cameraImageFailed = true; });
-  image.addEventListener("load", () => { state.cameraImageFailed = false; });
+  const mask = el("camera-mask-stream");
+  const debug = el("camera-debug-stream");
+  for (const feed of [image, mask, debug]) {
+    feed.addEventListener("error", () => { state.cameraImageFailed = true; });
+    feed.addEventListener("load", () => { state.cameraImageFailed = false; });
+  }
   el("camera-preview-toggle").addEventListener("change", event => setCameraPreviewEnabled(event.target.checked));
+  el("camera-detection-mode").addEventListener("change", event => setCameraDetectionMode(event.target.value));
   window.addEventListener("pagehide", () => {
     if (state.cameraEnabled) {
       fetch("/api/camera/preview", {
@@ -83,12 +88,18 @@ async function restorePickupCameraPreview() {
 async function setCameraPreviewEnabled(enabled) {
   const toggle = el("camera-preview-toggle");
   const image = el("camera-stream");
+  const mask = el("camera-mask-stream");
+  const debug = el("camera-debug-stream");
   toggle.disabled = true;
   if (!enabled) {
     state.cameraEnabled = false;
     window.clearTimeout(state.cameraPollTimer);
     image.removeAttribute("src");
     image.hidden = true;
+    mask.removeAttribute("src");
+    mask.hidden = true;
+    debug.removeAttribute("src");
+    debug.hidden = true;
     state.cameraAvailable = false;
     state.cameraImageFailed = false;
     setChip("camera-chip", "PREVIEW OFF", "neutral");
@@ -117,6 +128,42 @@ async function setCameraPreviewEnabled(enabled) {
   }
 }
 
+async function setCameraDetectionMode(mode) {
+  const selector = el("camera-detection-mode");
+  selector.disabled = true;
+  try {
+    await api("/api/camera/detection-mode", {detection_mode: mode});
+    updateCameraDetectionMode(mode);
+    refreshCameraStatus();
+  } catch (error) {
+    announce(error.message);
+    refreshCameraStatus();
+  } finally {
+    selector.disabled = false;
+  }
+}
+
+function updateCameraDetectionMode(mode) {
+  el("camera-detection-mode").value = mode;
+  el("camera-feed-caption").textContent = mode === "hough"
+    ? "Camera + Hough circle detections (green)"
+    : "Camera + HSV locator overlay";
+  el("camera-mask-stream").parentElement.hidden = mode !== "hsv";
+  el("camera-debug-panel").hidden = mode !== "hough";
+}
+
+function setCameraFeed(id, endpoint, visible, retry = false) {
+  const image = el(id);
+  image.hidden = !visible;
+  if (!visible) {
+    image.removeAttribute("src");
+    delete image.dataset.endpoint;
+  } else if (retry || image.dataset.endpoint !== endpoint) {
+    image.dataset.endpoint = endpoint;
+    image.src = `${endpoint}?retry=${Date.now()}`;
+  }
+}
+
 async function refreshCameraStatus() {
   if (!state.cameraEnabled) return;
   try {
@@ -132,6 +179,7 @@ async function refreshCameraStatus() {
 
 function renderCameraStatus(status) {
   if (!state.cameraEnabled) return;
+  updateCameraDetectionMode(status.detection_mode || "hsv");
   const available = Boolean(status.available);
   const starting = ["starting", "connecting"].includes(status.state);
   setChip("camera-chip", available ? "CAMERA LIVE" : starting ? "CAMERA STARTING" : "CAMERA UNAVAILABLE", available ? "ready" : starting ? "warning" : "error");
@@ -142,14 +190,11 @@ function renderCameraStatus(status) {
     "camera-details",
     `${status.message} ${status.device} · ${status.width}×${status.height} · ROI center ${roi.center_x}, ${roi.center_y} (${roi.width}×${roi.height})${detected}${presence}`,
   );
-  if (available && (!state.cameraAvailable || state.cameraImageFailed)) {
-    el("camera-stream").hidden = false;
-    el("camera-stream").src = `/api/camera/stream?retry=${Date.now()}`;
-    state.cameraImageFailed = false;
-  } else if (!available) {
-    el("camera-stream").removeAttribute("src");
-    el("camera-stream").hidden = true;
-  }
+  const retryFeeds = available && (!state.cameraAvailable || state.cameraImageFailed);
+  setCameraFeed("camera-stream", "/api/camera/stream", available, retryFeeds);
+  setCameraFeed("camera-mask-stream", "/api/camera/mask", available && status.detection_mode !== "hough", retryFeeds);
+  setCameraFeed("camera-debug-stream", "/api/camera/debug", available && status.detection_mode === "hough", retryFeeds);
+  if (retryFeeds) state.cameraImageFailed = false;
   state.cameraAvailable = available;
   state.cameraImageFailed = !available;
 }
@@ -256,11 +301,11 @@ function renderStepper(currentPhase, workflowState) {
 function renderRack(rack) {
   setText("rack-title", `Rack ${rack.rows} × ${rack.columns}`);
   const grid = el("rack-grid");
-  grid.style.gridTemplateColumns = `42px repeat(${rack.columns}, minmax(48px, 1fr))`;
+  grid.style.gridTemplateColumns = `42px repeat(${rack.columns}, 64px)`;
   grid.replaceChildren();
   const corner = document.createElement("span"); corner.className = "rack-corner"; corner.setAttribute("aria-hidden", "true"); grid.append(corner);
   for (let column = 1; column <= rack.columns; column++) grid.append(label(`C${column}`, "column"));
-  for (let row = 1; row <= rack.rows; row++) {
+  for (let row = rack.rows; row >= 1; row--) {
     grid.append(label(`R${row}`, "row"));
     for (let column = 1; column <= rack.columns; column++) {
       const tube = rack.tubes.find(item => item.row === row && item.column === column);
@@ -297,7 +342,8 @@ function renderLocateTubePlan(tube) {
     "Move gripper to corrected tube XY at safe Z",
     "Turn vacuum on",
     `Lower to pickup Z ${number(rack.pickup_height_mm)} mm`,
-    `Lift to safe Z ${number(rack.safe_z_mm)} mm; vacuum remains on`,
+    `Lift to scan Z ${number(rack.scan_height_mm)} mm; vacuum remains on`,
+    "Return to the selected tube slot center, lower, release the tube, turn vacuum off, and lift to scan Z",
   ];
   setText("locate-tube-plan", `R${tube.row} C${tube.column} plan: camera X ${number(cameraX)} Y ${number(cameraY)} mm; nominal tube XY X ${number(tube.position_mm.x)} Y ${number(tube.position_mm.y)} mm; pixel scale ${number(rack.pixel_to_mm_multiplier)} mm/px.`);
   const list = document.createElement("ol");
@@ -326,7 +372,7 @@ function renderCameraPickupSession(session) {
     setText("locate-tube-status", `Paused before step ${session.next_step + 1}: ${current.label}. Press Run Next Step to execute only this step.`);
     el("run-next-pickup-step-button").textContent = `Run Step ${session.next_step + 1} of ${session.steps.length}`;
   } else if (session.state === "completed") {
-    setText("locate-tube-status", "Pickup sequence complete. Vacuum is still on; turn it off manually when ready.");
+    setText("locate-tube-status", "Pickup and deposit complete. Tube returned to the selected slot; vacuum is off.");
   } else if (session.state === "cancelled") {
     setText("locate-tube-status", `Step-through cancelled. Vacuum ${session.vacuum_enabled ? "remains on" : "is off"}.`);
   } else if (session.state === "failed") {
@@ -342,7 +388,7 @@ function showTubeDetails(tube) {
   setText("tube-details", details.join(" · "));
 }
 function rackKeydown(event) {
-  const keyMap = {ArrowLeft: [0,-1], ArrowRight:[0,1], ArrowUp:[-1,0], ArrowDown:[1,0]};
+  const keyMap = {ArrowLeft: [0,-1], ArrowRight:[0,1], ArrowUp:[1,0], ArrowDown:[-1,0]};
   if (!keyMap[event.key]) return;
   event.preventDefault();
   const [dr, dc] = keyMap[event.key];
@@ -474,7 +520,7 @@ async function runNextCameraPickupStep() {
     const updated = await api("/api/actions/locate-tube/step", {session_id: session.session_id});
     renderCameraPickupSession(updated);
     if (updated.state === "completed") {
-      announce("Pickup sequence complete. Vacuum remains on.");
+      announce("Pickup and deposit complete. Tube returned to the selected slot; vacuum is off.");
       if (!state.cameraPickupPreviewWasEnabled) await setCameraPreviewEnabled(false);
     }
   } catch (error) {

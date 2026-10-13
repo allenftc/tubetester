@@ -33,6 +33,7 @@ class RackSettings:
     pixel_to_mm_multiplier: float
     pickup_height_mm: float
     safe_z_mm: float
+    scan_height_mm: float
     columns: int = 1
     rows: int = 1
 
@@ -124,6 +125,7 @@ def load_settings(config_dir: Path) -> ControllerSettings:
             float(rack_data["origin_mm"]["z"]) + float(rack_data["pickup_offset_mm"]["z"]),
         )),
         safe_z_mm=float(rack_data["safe_z_mm"]),
+        scan_height_mm=float(rack_data.get("scan_height_mm", rack_data["safe_z_mm"])),
         columns=int(rack_data.get("columns", 1)),
         rows=int(rack_data.get("rows", 1)),
     )

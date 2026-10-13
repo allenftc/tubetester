@@ -38,7 +38,10 @@ def create_control_app(
     app.router.add_get("/api/status", _status)
     app.router.add_get("/api/camera/status", _camera_status)
     app.router.add_get("/api/camera/stream", _camera_stream)
+    app.router.add_get("/api/camera/mask", _camera_mask_stream)
+    app.router.add_get("/api/camera/debug", _camera_debug_stream)
     app.router.add_post("/api/camera/preview", _camera_preview_toggle)
+    app.router.add_post("/api/camera/detection-mode", _camera_detection_mode)
     app.router.add_post("/api/actions/home", _home)
     app.router.add_post("/api/actions/preview", _preview)
     app.router.add_post("/api/actions/locate-tube", _locate_tube)
@@ -140,7 +143,34 @@ async def _camera_preview_toggle(request: web.Request) -> web.Response:
     return web.json_response({"ok": True, "enabled": enabled, "camera": preview.status()})
 
 
+async def _camera_detection_mode(request: web.Request) -> web.Response:
+    body = await _json_body(request)
+    mode = body.get("detection_mode")
+    if mode not in {"hsv", "hough"}:
+        raise ValueError("detection_mode must be 'hsv' or 'hough'")
+    preview: CameraPreviewService = request.app["camera_preview"]
+    preview.set_detection_mode(mode)
+    return web.json_response({"ok": True, "detection_mode": mode})
+
+
 async def _camera_stream(request: web.Request) -> web.StreamResponse:
+    return await _camera_mjpeg_stream(request, mask=False)
+
+
+async def _camera_mask_stream(request: web.Request) -> web.StreamResponse:
+    return await _camera_mjpeg_stream(request, mask=True)
+
+
+async def _camera_debug_stream(request: web.Request) -> web.StreamResponse:
+    return await _camera_mjpeg_stream(request, debug=True)
+
+
+async def _camera_mjpeg_stream(
+    request: web.Request,
+    *,
+    mask: bool = False,
+    debug: bool = False,
+) -> web.StreamResponse:
     preview: CameraPreviewService = request.app["camera_preview"]
     status = preview.status()
     if status["state"] in {"not_started", "stopped", "stopping"}:
@@ -158,9 +188,14 @@ async def _camera_stream(request: web.Request) -> web.StreamResponse:
     )
     await response.prepare(request)
     sequence = 0
+    wait_for_frame = (
+        preview.wait_for_debug_frame if debug
+        else preview.wait_for_mask_frame if mask
+        else preview.wait_for_frame
+    )
     try:
         while True:
-            sequence, jpeg = await asyncio.to_thread(preview.wait_for_frame, sequence, 5.0)
+            sequence, jpeg = await asyncio.to_thread(wait_for_frame, sequence, 5.0)
             if jpeg is None:
                 if not preview.status()["available"]:
                     break

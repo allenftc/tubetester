@@ -1,0 +1,13 @@
+.rack-grid {
+  grid-auto-rows: 64px;
+  min-width: max-content;
+}
+
+.rack-label.column {
+  height: 64px;
+}
+
+.rack-cell {
+  min-height: 0;
+  aspect-ratio: 1;
+}

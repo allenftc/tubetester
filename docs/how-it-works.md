@@ -18,9 +18,10 @@ The key values live in [calibration/rack.json](../calibration/rack.json):
 - origin_mm: the top-left or reference point of the rack in machine coordinates
 - tube_pitch_mm: spacing between neighboring tube centers
 - pickup_offset_mm: extra offset for the actual pickup point inside the tube pocket
-- camera_offset_mm: how far the camera is from the gripper in XY
-- safe_z_mm: a high safe height used between moves
+- camera_offset_mm: signed camera position relative to the gripper in machine XY
+- safe_z_mm: the height used for XY travel around the rack
 - pickup_height_mm: the Z height at which the tool should descend to pick up the tube
+- scan_height_mm: the height to lift a picked tube to after pickup; it must be at least safe_z_mm
 - pixel_to_mm_multiplier: how many millimeters one pixel represents after the camera correction
 
 The logic is simple:
@@ -45,18 +46,20 @@ The controller does this in the runtime layer in [controller/web/runtime.py](../
 The formula is:
 
 - correction_x = (detected_x - roi_center_x) * pixel_to_mm_multiplier
-- correction_y = (detected_y - roi_center_y) * pixel_to_mm_multiplier
+- correction_y = (roi_center_y - detected_y) * pixel_to_mm_multiplier
 - corrected_target_x = tube_x + correction_x
 - corrected_target_y = tube_y + correction_y
 
 This is why the robot can still land on the tube even when the camera view is slightly off-center or the camera sees the tube shifted in the frame.
+Image pixel Y increases downward, opposite to machine +Y, so the vertical correction reverses the pixel delta.
 
 ## 3. Why there is a safe Z and a pickup Z
 
-The machine uses two different Z heights:
+The machine uses three Z heights:
 
-- safe_z_mm: the height used when moving around, before detection, and after pickup
+- safe_z_mm: the height used when moving around, before detection, and while aligning above a tube
 - pickup_height_mm: the lower Z height used to actually contact the tube and hold it with vacuum
+- scan_height_mm: the height used to lift the held tube after pickup
 
 This matters because the robot should never move at the low pickup height unless it is already lined up. It always approaches at safe Z, then moves to the camera point, finds the tube, then adds the correction, and only then descends to pickup_height_mm.
 
@@ -68,13 +71,13 @@ The flow is:
 
 - select a tube cell in the rack grid
 - begin a pickup session
-- review the planned coordinates and list of seven steps
+- review the planned coordinates and list of eight steps
 - run one step at a time with Run Next Step
 - each click calls a step endpoint and performs exactly one action
 
 The runtime keeps a pickup session in memory so the UI can pause mid-sequence instead of doing everything in one giant request.
 
-## 5. The seven pickup steps
+## 5. The pickup steps
 
 The pickup stepper is intentionally explicit. It usually goes in this order:
 
@@ -84,9 +87,10 @@ The pickup stepper is intentionally explicit. It usually goes in this order:
 4. compute corrected gripper XY and move the gripper there at safe Z
 5. turn vacuum on
 6. move down to pickup_height_mm
-7. lift back to safe Z while vacuum stays on
+7. lift to scan_height_mm while vacuum stays on
+8. return to the selected tube slot's nominal center XY, lower to pickup_height_mm, release the tube, turn vacuum off, and lift to scan_height_mm
 
-If step 3 finds no tube center, the sequence stops before the final gripper move. That is the safety check that prevents a bad pickup.
+The deposit uses the nominal slot center, not the camera-corrected pickup target or camera offset. If step 3 finds no tube center, the sequence stops before the final gripper move. That is the safety check that prevents a bad pickup.
 
 ## 6. Safety behavior
 
@@ -97,7 +101,7 @@ The runtime locks out other machine actions while the pickup step-through is act
 - camera preview shutdown while the step sequence still needs it
 - tool controls from interfering with a partially completed pickup
 
-If something goes wrong or you want to abort, Cancel Steps raises the held tube back to safe Z before unlocking the controls. Vacuum stays on unless you deliberately turn it off.
+If something goes wrong or you want to abort, Cancel Steps raises the held tube back to safe Z before unlocking the controls when it is below safe Z. Vacuum stays on unless you deliberately turn it off.
 
 ## 7. What the code path looks like
 

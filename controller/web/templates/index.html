@@ -6,6 +6,7 @@
   <meta name="color-scheme" content="dark light">
   <title>Tube Tester Control</title>
   <link rel="stylesheet" href="/static/app.css">
+  <link rel="stylesheet" href="/static/rack.css">
   <script src="/static/app.js" defer></script>
 </head>
 <body>
@@ -57,7 +58,27 @@
         <input id="camera-preview-toggle" type="checkbox">
         Enable live camera preview
       </label>
-      <img id="camera-stream" alt="Live camera frame with locator ROI and center overlay" hidden style="width:100%;max-height:68vh;aspect-ratio:16/9;object-fit:contain;background:#070b10;border:1px solid var(--border);border-radius:6px;margin-top:16px">
+      <label for="camera-detection-mode" style="display:flex;align-items:center;gap:8px;margin-top:12px">
+        Detection method
+        <select id="camera-detection-mode">
+          <option value="hsv">HSV threshold mask</option>
+          <option value="hough">Hough circles</option>
+        </select>
+      </label>
+      <div class="camera-feed-grid" style="display:grid;grid-template-columns:repeat(auto-fit,minmax(min(100%,320px),1fr));gap:14px;margin-top:16px">
+        <figure style="margin:0;min-width:0">
+          <figcaption id="camera-feed-caption" class="muted" style="margin-bottom:6px">Camera + HSV locator overlay</figcaption>
+          <img id="camera-stream" alt="Live camera frame with locator ROI and center overlay" hidden style="width:100%;max-height:55vh;aspect-ratio:4/3;object-fit:contain;background:#070b10;border:1px solid var(--border);border-radius:6px">
+        </figure>
+        <figure style="margin:0;min-width:0">
+          <figcaption class="muted" style="margin-bottom:6px">Raw HSV threshold (white = match, rotated ROI)</figcaption>
+          <img id="camera-mask-stream" alt="Live raw HSV threshold mask; white pixels match the configured HSV range" hidden style="width:100%;max-height:55vh;aspect-ratio:4/3;object-fit:contain;background:#070b10;border:1px solid var(--border);border-radius:6px">
+        </figure>
+        <figure id="camera-debug-panel" style="margin:0;min-width:0" hidden>
+          <figcaption class="muted" style="margin-bottom:6px">Hough detector Mats: ROI, grayscale, blur input, detections</figcaption>
+          <img id="camera-debug-stream" alt="Hough debugging Mats: rotated region of interest, grayscale image, blurred Hough input, and circle detections" hidden style="width:100%;max-height:55vh;aspect-ratio:4/3;object-fit:contain;background:#070b10;border:1px solid var(--border);border-radius:6px">
+        </figure>
+      </div>
       <p id="camera-details" class="muted" role="status" style="margin:10px 0 0">Preview is off. Camera capture is stopped.</p>
     </section>
 
