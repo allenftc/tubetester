@@ -7,6 +7,10 @@ from typing import Any
 
 from controller.network.moonraker import MoonrakerResponse
 from controller.vision.camera_preview import CameraPreviewService
+from controller.vision.tubeLocator.tube_locator import (
+    STEREO_BASELINE_MM,
+    triangulate_stereo_circles,
+)
 from controller.web.events import utc_timestamp
 from controller.web.errors import RuntimeConflict, RuntimeUnavailable
 
@@ -85,6 +89,8 @@ class MachineActions:
         )
 
     async def _send_action(self, action: str, script: str, source: str) -> dict[str, Any]:
+        if self._stereo_test_active:
+            raise RuntimeConflict("Machine controls are locked while the standalone stereo test is running.")
         if self.debug_pickup_active:
             raise RuntimeConflict("Machine controls are locked while a camera-guided pickup is being stepped.")
         correlation_id = f"req_{uuid.uuid4().hex}"
@@ -111,6 +117,8 @@ class MachineActions:
             raise RuntimeUnavailable("Klipper must be ready and the workflow inactive before running a tooling macro.")
         correlation_id = f"req_{uuid.uuid4().hex}"
         async with self._manual_macro_lock:
+            if self._stereo_test_active:
+                raise RuntimeConflict("Machine controls are locked while the standalone stereo test is running.")
             self.events.publish(f"Starting {action}.", source="user", correlation_id=correlation_id)
             for kind, value in steps:
                 if kind == "gcode":
@@ -135,6 +143,123 @@ class MachineActions:
 class CameraPickupActions:
     """Camera-guided pickup controls, including the step-by-step safety flow."""
 
+    async def test_camera_stereo(
+        self,
+        row: int,
+        column: int,
+        camera_preview: CameraPreviewService,
+    ) -> dict[str, Any]:
+        if isinstance(row, bool) or not isinstance(row, int) or not 1 <= row <= self.settings.rack.rows:
+            raise ValueError("row is outside rack bounds")
+        if isinstance(column, bool) or not isinstance(column, int) or not 1 <= column <= self.settings.rack.columns:
+            raise ValueError("column is outside rack bounds")
+
+        async with self._debug_pickup_lock:
+            if self._stereo_test_active or self.debug_pickup_active:
+                raise RuntimeConflict("Another camera-guided operation is already active.")
+            async with self._lock:
+                workflow_active = self._workflow["state"] in {"starting", "running", "paused", "stopping"}
+                if not self._machine["connected"] or self._machine["klipper_state"] != "ready" or workflow_active:
+                    raise RuntimeUnavailable("Klipper must be ready and the workflow inactive before running a stereo test.")
+                self._stereo_test_active = True
+            self._broadcast_status()
+            preview_was_running = False
+            original_detection_mode = "hsv"
+            tube = self.settings.rack.tube_position(row - 1, column - 1)
+            camera_offset = self.settings.rack.camera_offset_mm
+            center_x = tube.x - camera_offset.x
+            center_y = tube.y - camera_offset.y
+            half_baseline = STEREO_BASELINE_MM / 2.0
+            moved_from_center = False
+            correlation_id = f"req_{uuid.uuid4().hex}"
+            try:
+                camera_status = camera_preview.status()
+                preview_was_running = camera_status["state"] not in {"not_started", "stopped"}
+                original_detection_mode = camera_status["detection_mode"]
+                if not preview_was_running:
+                    await asyncio.to_thread(camera_preview.start)
+                camera_preview.set_detection_mode("hough")
+                await self._send_macro_gcode(
+                    self.motion.synchronized_move_command(z=self.settings.rack.safe_z_mm, feedrate=10000),
+                    correlation_id,
+                )
+                moved_from_center = True
+                await self._send_macro_gcode(
+                    self.motion.synchronized_move_command(
+                        x=center_x - half_baseline,
+                        y=center_y,
+                        feedrate=10000,
+                    ),
+                    correlation_id,
+                )
+                left_sequence = camera_preview.status()["sequence"]
+                left = await asyncio.to_thread(camera_preview.wait_for_hough_detection, left_sequence, 10, 8.0)
+                if left is None:
+                    raise RuntimeUnavailable("No tube circle was detected at the left stereo test position.")
+
+                await self._send_macro_gcode(
+                    self.motion.synchronized_move_command(
+                        x=center_x + half_baseline,
+                        y=center_y,
+                        feedrate=10000,
+                    ),
+                    correlation_id,
+                )
+                right_sequence = camera_preview.status()["sequence"]
+                right = await asyncio.to_thread(camera_preview.wait_for_hough_detection, right_sequence, 10, 8.0)
+                if right is None:
+                    raise RuntimeUnavailable("No tube circle was detected at the right stereo test position.")
+
+                position = triangulate_stereo_circles(
+                    (float(left["detected_center"][0]), float(left["detected_center"][1])),
+                    (float(right["detected_center"][0]), float(right["detected_center"][1])),
+                    (int(right["width"]), int(right["height"])),
+                )
+                result = {
+                    "ok": True,
+                    "action": "camera.stereo_test",
+                    "row": row,
+                    "column": column,
+                    "center_xy_mm": {"x": center_x, "y": center_y},
+                    "left_center_px": left["detected_center"],
+                    "right_center_px": right["detected_center"],
+                    "position_relative_to_center_mm": {
+                        "x": position[0],
+                        "y": position[1],
+                        "z": position[2],
+                    },
+                    "baseline_mm": STEREO_BASELINE_MM,
+                    "message": (
+                        f"Stereo estimate relative to scan midpoint: "
+                        f"X={position[0]:.2f} mm, Y={position[1]:.2f} mm, Z={position[2]:.2f} mm."
+                    ),
+                }
+                self.events.publish(result["message"], source="camera", correlation_id=correlation_id)
+                return result
+            finally:
+                try:
+                    if moved_from_center:
+                        await self._send_macro_gcode(
+                            self.motion.synchronized_move_command(x=center_x, y=center_y, feedrate=10000),
+                            correlation_id,
+                        )
+                except Exception:
+                    self.events.publish(
+                        "Standalone stereo test could not return the camera to the scan midpoint.",
+                        source="camera",
+                        level="error",
+                        correlation_id=correlation_id,
+                    )
+                    raise
+                finally:
+                    try:
+                        camera_preview.set_detection_mode(original_detection_mode)
+                        if not preview_was_running:
+                            await asyncio.to_thread(camera_preview.stop)
+                    finally:
+                        self._stereo_test_active = False
+                        self._broadcast_status()
+
     async def begin_camera_pickup(
         self,
         row: int,
@@ -145,9 +270,6 @@ class CameraPickupActions:
             raise ValueError("row is outside rack bounds")
         if isinstance(column, bool) or not isinstance(column, int) or not 1 <= column <= self.settings.rack.columns:
             raise ValueError("column is outside rack bounds")
-        multiplier = self.settings.rack.pixel_to_mm_multiplier
-        if not 0 < multiplier <= 1:
-            raise RuntimeUnavailable("rack.json pixel_to_mm_multiplier must be greater than 0 and at most 1 mm per pixel.")
         pickup_height = self.settings.rack.pickup_height_mm
         safe_z = self.settings.rack.safe_z_mm
         if not math.isfinite(pickup_height) or not math.isfinite(safe_z) or pickup_height >= safe_z:
@@ -167,7 +289,7 @@ class CameraPickupActions:
             camera_preview.set_detection_mode("hough")
             if started_by_session:
                 await asyncio.to_thread(camera_preview.start)
-            _, frame = await asyncio.to_thread(camera_preview.wait_for_frame, -1, 8.0)
+            _, frame = await asyncio.to_thread(camera_preview.wait_for_frame, 0, 8.0)
             if frame is None:
                 if started_by_session:
                     await asyncio.to_thread(camera_preview.stop)
@@ -178,10 +300,13 @@ class CameraPickupActions:
             camera_x = tube.x - offset.x
             camera_y = tube.y - offset.y
             target = {"x": None, "y": None}
+            stereo_half_baseline = STEREO_BASELINE_MM / 2.0
             steps = [
                 {"label": f"Raise to safe Z={safe_z:.2f} mm", "command": self.motion.synchronized_move_command(z=safe_z, feedrate=10000), "state": "pending"},
-                {"label": f"Move camera to X={camera_x:.2f} Y={camera_y:.2f} mm", "command": self.motion.synchronized_move_command(x=camera_x, y=camera_y, feedrate=10000), "state": "pending"},
-                {"label": "Scan camera ROI for fresh tube-center detection", "command": "CAMERA_DETECT", "state": "pending"},
+                {"label": f"Move camera to left stereo view X={camera_x - stereo_half_baseline:.2f} Y={camera_y:.2f} mm", "command": self.motion.synchronized_move_command(x=camera_x - stereo_half_baseline, y=camera_y, feedrate=10000), "state": "pending"},
+                {"label": "Capture left stereo view of the tube center", "command": "CAMERA_CAPTURE_LEFT", "state": "pending"},
+                {"label": f"Move camera to right stereo view X={camera_x + stereo_half_baseline:.2f} Y={camera_y:.2f} mm", "command": self.motion.synchronized_move_command(x=camera_x + stereo_half_baseline, y=camera_y, feedrate=10000), "state": "pending"},
+                {"label": "Capture right stereo view and estimate tube XYZ", "command": "CAMERA_CAPTURE_RIGHT", "state": "pending"},
                 {"label": "Move gripper to corrected XY at safe Z", "command": "WAITING_FOR_DETECTION", "state": "pending"},
                 {"label": "Turn vacuum on", "command": self.motion.pickup_command(), "state": "pending"},
                 {"label": f"Lower to pickup Z={pickup_height:.2f} mm", "command": self.motion.synchronized_move_command(z=pickup_height, feedrate=3000), "state": "pending"},
@@ -210,7 +335,9 @@ class CameraPickupActions:
                 "camera_xy": {"x": camera_x, "y": camera_y},
                 "target_xy": target,
                 "detection_sequence": None,
+                "left_center_px": None,
                 "detected_center_px": None,
+                "stereo_position_mm": None,
                 "correction_mm": None,
                 "pickup_height_mm": pickup_height,
                 "scan_height_mm": scan_height,
@@ -239,7 +366,7 @@ class CameraPickupActions:
             step = session["steps"][index]
             correlation_id = session["correlation_id"]
             try:
-                if index == 2:
+                if index in {2, 4}:
                     step["state"] = "running"
                     detection = await asyncio.to_thread(
                         camera_preview.wait_for_hough_detection,
@@ -248,24 +375,47 @@ class CameraPickupActions:
                         8.0,
                     )
                     if detection is None:
-                        raise RuntimeUnavailable("No tube center detected in the camera ROI; no gripper correction or pickup was made.")
-                    offset = detection["detected_offset_roi"]
-                    correction_x = offset[0] * self.settings.rack.pixel_to_mm_multiplier
-                    correction_y = -offset[1] * self.settings.rack.pixel_to_mm_multiplier
+                        view = "left" if index == 2 else "right"
+                        raise RuntimeUnavailable(f"No tube center detected in the {view} stereo view; no pickup was made.")
                     center = detection["detected_center"]
-                    target_x = session["tube_xy"]["x"] + correction_x
-                    target_y = session["tube_xy"]["y"] + correction_y
-                    session["target_xy"] = {"x": target_x, "y": target_y}
-                    session["detected_center_px"] = center
-                    session["correction_mm"] = {"x": correction_x, "y": correction_y}
-                    next_step = session["steps"][3]
-                    next_step["command"] = self.motion.synchronized_move_command(x=target_x, y=target_y, feedrate=5000)
-                    next_step["label"] = f"Move gripper to corrected X={target_x:.2f} Y={target_y:.2f} mm at safe Z"
-                    self.events.publish(
-                        f"Detected center px=({center[0]}, {center[1]}); correction X={correction_x:.2f} Y={correction_y:.2f} mm; gripper target X={target_x:.2f} Y={target_y:.2f} mm.",
-                        source="camera",
-                        correlation_id=correlation_id,
-                    )
+                    if index == 2:
+                        session["left_center_px"] = center
+                        self.events.publish(
+                            f"Captured left stereo circle center px=({center[0]:.1f}, {center[1]:.1f}).",
+                            source="camera",
+                            correlation_id=correlation_id,
+                        )
+                    else:
+                        left_center = session["left_center_px"]
+                        if left_center is None:
+                            raise RuntimeError("The left stereo view was not captured before the right view.")
+                        stereo_position = triangulate_stereo_circles(
+                            (float(left_center[0]), float(left_center[1])),
+                            (float(center[0]), float(center[1])),
+                            (int(detection["width"]), int(detection["height"])),
+                        )
+                        correction_x, stereo_y, depth = stereo_position
+                        correction_y = -stereo_y
+                        target_x = session["tube_xy"]["x"] + correction_x
+                        target_y = session["tube_xy"]["y"] + correction_y
+                        session["target_xy"] = {"x": target_x, "y": target_y}
+                        session["detected_center_px"] = center
+                        session["stereo_position_mm"] = {
+                            "x": correction_x,
+                            "y": stereo_y,
+                            "z": depth,
+                        }
+                        session["correction_mm"] = {"x": correction_x, "y": correction_y}
+                        next_step = session["steps"][5]
+                        next_step["command"] = self.motion.synchronized_move_command(x=target_x, y=target_y, feedrate=5000)
+                        next_step["label"] = f"Move gripper to stereo-corrected X={target_x:.2f} Y={target_y:.2f} mm at safe Z"
+                        self.events.publish(
+                            f"Stereo tube estimate camera XYZ=({correction_x:.2f}, {stereo_y:.2f}, {depth:.2f}) mm; "
+                            f"correction X={correction_x:.2f} Y={correction_y:.2f} mm; "
+                            f"gripper target X={target_x:.2f} Y={target_y:.2f} mm.",
+                            source="camera",
+                            correlation_id=correlation_id,
+                        )
                 else:
                     step["state"] = "running"
                     command = step["command"]
@@ -278,15 +428,15 @@ class CameraPickupActions:
                     await self._send_macro_gcode(command, correlation_id)
                     if index == 0:
                         session["current_z"] = session["safe_z_mm"]
-                    elif index == 1:
+                    elif index in {1, 3}:
                         session["detection_sequence"] = camera_preview.status()["sequence"]
-                    elif index == 4:
-                        session["vacuum_enabled"] = True
-                    elif index == 5:
-                        session["current_z"] = session["pickup_height_mm"]
                     elif index == 6:
-                        session["current_z"] = session["scan_height_mm"]
+                        session["vacuum_enabled"] = True
                     elif index == 7:
+                        session["current_z"] = session["pickup_height_mm"]
+                    elif index == 8:
+                        session["current_z"] = session["scan_height_mm"]
+                    elif index == 9:
                         session["current_z"] = session["scan_height_mm"]
                         session["target_xy"] = session["tube_xy"]
                         session["vacuum_enabled"] = False
@@ -307,7 +457,7 @@ class CameraPickupActions:
             except Exception:
                 step["state"] = "failed"
                 session["state"] = "failed"
-                if index in {0, 5, 6, 7}:
+                if index in {0, 7, 8, 9}:
                     session["current_z"] = None
                 self._broadcast_status()
                 raise
@@ -351,7 +501,9 @@ class CameraPickupActions:
             "camera_xy": dict(session["camera_xy"]),
             "tube_xy": dict(session["tube_xy"]),
             "target_xy": dict(session["target_xy"]),
+            "left_center_px": list(session["left_center_px"]) if session["left_center_px"] else None,
             "detected_center_px": session["detected_center_px"],
+            "stereo_position_mm": dict(session["stereo_position_mm"]) if session["stereo_position_mm"] else None,
             "correction_mm": dict(session["correction_mm"]) if session["correction_mm"] else None,
             "pickup_height_mm": session["pickup_height_mm"],
             "scan_height_mm": session["scan_height_mm"],
@@ -390,6 +542,8 @@ class WorkflowControlActions:
                 raise RuntimeConflict("A workflow is already running.")
             if self.debug_pickup_active:
                 raise RuntimeConflict("A camera-guided pickup step-through is active.")
+            if self._stereo_test_active:
+                raise RuntimeConflict("The standalone stereo test is active.")
             issues = self._readiness_issues(self._machine)
             blocking = [issue for issue in issues if not issue.get("overridable", False)]
             if blocking or (issues and not degraded_mode):

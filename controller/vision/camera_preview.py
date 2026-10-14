@@ -12,8 +12,8 @@ from controller.config.settings import CameraSettings
 from controller.vision.tubeLocator.tube_locator import TubeLocator
 
 
-PREVIEW_WIDTH = 320
-PREVIEW_HEIGHT = 240
+PREVIEW_WIDTH = 640
+PREVIEW_HEIGHT = 480
 
 
 class CameraPreviewService:
@@ -159,14 +159,15 @@ class CameraPreviewService:
         frame_count: int = 10,
         timeout_seconds: float = 8.0,
     ) -> dict[str, Any] | None:
-        """Average valid Hough offsets from successive frames in rotated ROI space."""
+        """Average valid Hough centers and rotated-ROI offsets over fresh frames."""
         if frame_count <= 0:
             raise ValueError("frame_count must be greater than zero")
         deadline = time.monotonic() + timeout_seconds
-        samples: list[tuple[float, float]] = []
+        center_samples: list[tuple[float, float]] = []
+        offset_samples: list[tuple[float, float]] = []
         sequence = after_sequence
         with self._condition:
-            while len(samples) < frame_count:
+            while len(center_samples) < frame_count:
                 remaining = deadline - time.monotonic()
                 if remaining <= 0 or self._status["state"] in {"unavailable", "error", "stopped"}:
                     return None
@@ -179,22 +180,27 @@ class CameraPreviewService:
                 if self._sequence <= sequence:
                     return None
                 sequence = self._sequence
+                center = self._status["detected_center"]
                 offset = self._status["detected_offset_roi"]
+                if center is not None:
+                    center_samples.append((float(center[0]), float(center[1])))
                 if offset is not None:
-                    samples.append((float(offset[0]), float(offset[1])))
+                    offset_samples.append((float(offset[0]), float(offset[1])))
 
-            average = (
-                sum(offset[0] for offset in samples) / len(samples),
-                sum(offset[1] for offset in samples) / len(samples),
+            average_center = (
+                sum(point[0] for point in center_samples) / len(center_samples),
+                sum(point[1] for point in center_samples) / len(center_samples),
             )
+            average_offset = (
+                sum(point[0] for point in offset_samples) / len(offset_samples),
+                sum(point[1] for point in offset_samples) / len(offset_samples),
+            ) if offset_samples else None
             return {
                 **self._status,
                 "roi": dict(self._status["roi"]),
-                "detected_center": list(self._status["detected_center"])
-                if self._status["detected_center"] is not None
-                else None,
-                "detected_offset_roi": list(average),
-                "sample_count": len(samples),
+                "detected_center": list(average_center),
+                "detected_offset_roi": list(average_offset) if average_offset is not None else None,
+                "sample_count": len(center_samples),
                 "sequence": sequence,
             }
 

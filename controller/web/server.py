@@ -45,6 +45,7 @@ def create_control_app(
     app.router.add_post("/api/actions/home", _home)
     app.router.add_post("/api/actions/preview", _preview)
     app.router.add_post("/api/actions/locate-tube", _locate_tube)
+    app.router.add_post("/api/actions/stereo-test", _stereo_test)
     app.router.add_post("/api/actions/locate-tube/step", _locate_tube_step)
     app.router.add_post("/api/actions/locate-tube/cancel", _cancel_locate_tube)
     app.router.add_post("/api/tooling/release", _tooling_release)
@@ -231,6 +232,23 @@ async def _locate_tube(request: web.Request) -> web.Response:
         raise ValueError("column must be an integer")
     return web.json_response(
         await request.app["runtime"].begin_camera_pickup(
+            row,
+            column,
+            request.app["camera_preview"],
+        )
+    )
+
+
+async def _stereo_test(request: web.Request) -> web.Response:
+    body = await _json_body(request)
+    row = body.get("row")
+    column = body.get("column")
+    if isinstance(row, bool) or not isinstance(row, int):
+        raise ValueError("row must be an integer")
+    if isinstance(column, bool) or not isinstance(column, int):
+        raise ValueError("column must be an integer")
+    return web.json_response(
+        await request.app["runtime"].test_camera_stereo(
             row,
             column,
             request.app["camera_preview"],

@@ -49,6 +49,7 @@ class WorkflowController(MachineActions, CameraPickupActions, WorkflowControlAct
         self._hardware_initialized = False
         self._debug_pickup: dict[str, Any] | None = None
         self._debug_pickup_lock = asyncio.Lock()
+        self._stereo_test_active = False
         self._pause_gate = asyncio.Event()
         self._pause_gate.set()
         self._stop_requested = asyncio.Event()
@@ -157,6 +158,7 @@ class WorkflowController(MachineActions, CameraPickupActions, WorkflowControlAct
             "send_gcode": machine["klipper_state"] == "ready" and not active and not debug_active,
             "tooling": machine["klipper_state"] == "ready" and workflow["state"] in _TERMINAL_STATES and not debug_active,
             "camera_pickup_stepper": machine["klipper_state"] == "ready" and not active,
+            "stereo_test": machine["klipper_state"] == "ready" and not active and not debug_active and not self._stereo_test_active,
             "qr": self.qr_backend is not None,
             "degraded_mode": degraded_available,
         }

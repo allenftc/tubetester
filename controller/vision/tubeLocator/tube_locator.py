@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+from pathlib import Path
 from typing import Optional, Tuple
 
 import cv2
@@ -12,6 +13,61 @@ import numpy as np
 Point = Tuple[int, int]
 ROI = Tuple[int, int, int, int]
 Circle = Tuple[int, int, int]
+STEREO_BASELINE_MM = 10.0
+
+
+def triangulate_stereo_circles(
+	left_pixel: Point,
+	right_pixel: Point,
+	image_size: tuple[int, int],
+	baseline_mm: float = STEREO_BASELINE_MM,
+) -> tuple[float, float, float]:
+	"""Estimate a circle's midpoint-camera XYZ from two horizontally shifted views."""
+	width, height = image_size
+	if width <= 0 or height <= 0:
+		raise ValueError("image_size must contain positive width and height")
+	if not np.isfinite(baseline_mm) or baseline_mm <= 0:
+		raise ValueError("baseline_mm must be finite and greater than zero")
+	if not np.isfinite((*left_pixel, *right_pixel)).all():
+		raise ValueError("stereo pixel coordinates must be finite")
+
+	calibration_path = Path(__file__).with_name("camera_calibration.npz")
+	with np.load(calibration_path) as calibration:
+		required = {"camera_matrix", "distortion_coefficients", "image_size"}
+		missing = required.difference(calibration.files)
+		if missing:
+			raise ValueError(f"Camera calibration is missing arrays: {', '.join(sorted(missing))}")
+		camera_matrix = np.asarray(calibration["camera_matrix"], dtype=np.float64)
+		distortion = np.asarray(calibration["distortion_coefficients"], dtype=np.float64)
+		calibration_width, calibration_height = map(int, calibration["image_size"])
+
+	if (
+		camera_matrix.shape != (3, 3)
+		or distortion.size == 0
+		or not np.isfinite(camera_matrix).all()
+		or not np.isfinite(distortion).all()
+	):
+		raise ValueError("Camera calibration has invalid camera matrix or distortion coefficients")
+	if calibration_width <= 0 or calibration_height <= 0:
+		raise ValueError("Camera calibration image_size must contain positive dimensions")
+
+	scaled_matrix = camera_matrix.copy()
+	scaled_matrix[0, :] *= width / calibration_width
+	scaled_matrix[1, :] *= height / calibration_height
+	left = np.asarray([[left_pixel]], dtype=np.float32)
+	right = np.asarray([[right_pixel]], dtype=np.float32)
+	left_normalized = cv2.undistortPoints(left, scaled_matrix, distortion)[0, 0]
+	right_normalized = cv2.undistortPoints(right, scaled_matrix, distortion)[0, 0]
+	disparity = float(left_normalized[0] - right_normalized[0])
+	if not np.isfinite(disparity) or disparity <= 0:
+		raise ValueError("Stereo circle disparity must be positive; verify left/right capture order and baseline")
+
+	depth = baseline_mm / disparity
+	x_from_left_camera = float(left_normalized[0]) * depth
+	y_from_midpoint_camera = (
+		float(left_normalized[1]) + float(right_normalized[1])
+	) * depth / 2.0
+	return x_from_left_camera - baseline_mm / 2.0, y_from_midpoint_camera, depth
 
 
 def resize_to_resolution(
@@ -258,6 +314,24 @@ class TubeLocator:
 			cv2.circle(preview, (circle_x, circle_y), radius, (0, 255, 0), 2)
 			cv2.circle(preview, (circle_x, circle_y), 2, (0, 255, 0), -1)
 		cv2.drawMarker(preview, (center_x, center_y), (0, 220, 255), cv2.MARKER_CROSS, 16, 2)
+
+				# Your camera intrinsics
+		K = np.array([[496.16483041, 0., 344.61027747],
+					[0., 494.61583984, 261.16698538],
+					[0., 0., 1.]])
+		K /= 2
+		# 3D point: 10cm forward, 5cm left, 4cm up
+		# Assuming standard camera coordinates:
+		# X: right positive, so left = -5
+		# Y: down positive, so up = -4  
+		# Z: forward positive = 10
+		point_3d = np.array([0, 0, 10.5])  # [X, Y, Z] in cm
+
+		# Project to homogeneous pixel coordinates
+		point_homogeneous = K @ point_3d
+
+		cv2.drawMarker(preview, (345, 261), (255, 0, 0), cv2.MARKER_STAR, 20, 2)
+
 		if center is not None:
 			cv2.drawMarker(preview, center, (0, 0, 255), cv2.MARKER_CROSS, 20, 2)
 		status = "Tube present" if tube_present else "No tube present"
@@ -395,8 +469,8 @@ def main() -> None:
 				"default": cv2.CAP_ANY,
 			}
 			camera = cv2.VideoCapture(args.camera_index, backends[args.backend])
-			camera.set(cv2.CAP_PROP_FRAME_WIDTH, 320)
-			camera.set(cv2.CAP_PROP_FRAME_HEIGHT, 240)
+			camera.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
+			camera.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
 			if not camera.isOpened():
 				raise RuntimeError(
 					f"Could not open webcam with index {args.camera_index}"
@@ -445,7 +519,7 @@ def main() -> None:
 			if frame is None:
 				raise FileNotFoundError(f"Could not read image: {args.image}")
 
-			frame = resize_to_240p(frame)
+			frame = resize_to_480p(frame)
 			center, tube_present = locator.locate(frame, (160, 120, 75, 75))
 			print(f"Tube present: {tube_present}; center: {center}")
 			while True:

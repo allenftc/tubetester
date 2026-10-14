@@ -14,6 +14,7 @@ from controller.vision.camera_preview import (
     CameraPreviewService,
 )
 from controller.vision.tubeLocator.tube_locator import TubeLocator
+from controller.vision.tubeLocator.tube_locator import triangulate_stereo_circles
 
 
 class FakeCapture:
@@ -86,6 +87,37 @@ class CameraPreviewTests(unittest.TestCase):
         self.assertLessEqual(np.linalg.norm(np.array(center) - np.array((50, 50))), 3)
         self.assertTrue(circles)
         self.assertEqual(debug.shape, (320, 320, 3))
+
+    def test_stereo_triangulation_uses_calibration_and_scaled_image_dimensions(self) -> None:
+        calibration = np.load(
+            Path(__file__).resolve().parents[1] / "controller/vision/tubeLocator/camera_calibration.npz"
+        )
+        camera_matrix = calibration["camera_matrix"]
+        distortion = calibration["distortion_coefficients"]
+        calibration.close()
+        object_points = np.array([[[5.0, 0.0, 100.0], [-5.0, 0.0, 100.0]]], dtype=np.float32)
+        left_pixel, right_pixel = (
+            cv2.projectPoints(point.reshape(1, 1, 3), np.zeros(3), np.zeros(3), camera_matrix, distortion)[0][0, 0]
+            for point in object_points[0]
+        )
+
+        xyz = triangulate_stereo_circles(
+            (float(left_pixel[0]), float(left_pixel[1])),
+            (float(right_pixel[0]), float(right_pixel[1])),
+            (640, 480),
+        )
+        xyz_half_size = triangulate_stereo_circles(
+            (float(left_pixel[0] / 2), float(left_pixel[1] / 2)),
+            (float(right_pixel[0] / 2), float(right_pixel[1] / 2)),
+            (320, 240),
+        )
+
+        np.testing.assert_allclose(xyz, (0.0, 0.0, 100.0), atol=0.05)
+        np.testing.assert_allclose(xyz_half_size, xyz, atol=0.05)
+
+    def test_stereo_triangulation_rejects_invalid_disparity(self) -> None:
+        with self.assertRaisesRegex(ValueError, "disparity must be positive"):
+            triangulate_stereo_circles((160, 120), (160, 120), (320, 240))
 
     def test_preview_preserves_widescreen_aspect_ratio_and_roi_position(self) -> None:
         settings = load_settings(Path(__file__).resolve().parents[1] / "calibration").camera

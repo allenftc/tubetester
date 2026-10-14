@@ -77,6 +77,14 @@ class WorkflowRuntime:
     ) -> dict[str, Any]:
         return await self._controller.begin_camera_pickup(row, column, camera_preview)
 
+    async def test_camera_stereo(
+        self,
+        row: int,
+        column: int,
+        camera_preview: CameraPreviewService,
+    ) -> dict[str, Any]:
+        return await self._controller.test_camera_stereo(row, column, camera_preview)
+
     async def run_camera_pickup_step(
         self,
         session_id: str,

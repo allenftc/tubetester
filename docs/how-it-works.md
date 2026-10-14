@@ -6,7 +6,7 @@ The important idea is this:
 
 - the rack has a known coordinate system in millimeters
 - the camera sits a little offset from the gripper, so the robot must aim the camera at a different XY position than the actual tube pickup point
-- the camera finds the tube center in pixels, then the controller converts that offset into millimeters and moves the gripper to the corrected XY
+- the camera captures the tube circle from two X positions, triangulates its 3D location, and moves the gripper to the corrected XY
 - the workflow is intentionally broken into small deliberate steps so you can debug every move
 
 ## 1. Where the settings come from
@@ -22,7 +22,7 @@ The key values live in [calibration/rack.json](../calibration/rack.json):
 - safe_z_mm: the height used for XY travel around the rack
 - pickup_height_mm: the Z height at which the tool should descend to pick up the tube
 - scan_height_mm: the height to lift a picked tube to after pickup; it must be at least safe_z_mm
-- pixel_to_mm_multiplier: how many millimeters one pixel represents after the camera correction
+- camera intrinsics and distortion: stored in `controller/vision/tubeLocator/camera_calibration.npz`
 
 The logic is simple:
 
@@ -35,23 +35,20 @@ That second line is the key one: the camera is not mounted exactly at the grippe
 
 The controller does this in the runtime layer in [controller/web/runtime.py](../controller/web/runtime.py):
 
-1. choose the target rack tube
-2. compute the nominal tube position
-3. compute where the camera must be moved to view that tube
-4. wait for a fresh camera frame and a detected center
-5. compare the detected center to the camera ROI center in pixels
-6. convert the pixel difference into millimeters with pixel_to_mm_multiplier
-7. move the gripper to the final corrected XY
+1. choose the target rack tube and compute its nominal position
+2. compute the camera's nominal XY from the configured camera offset
+3. move to X-5 mm and capture a fresh circle center
+4. move to X+5 mm and capture a second fresh circle center (10 mm baseline)
+5. undistort both pixel centers using `camera_calibration.npz` and triangulate XYZ
+6. use the stereo X/Y offset to move the gripper to the corrected XY
 
-The formula is:
-
-- correction_x = (detected_x - roi_center_x) * pixel_to_mm_multiplier
-- correction_y = (roi_center_y - detected_y) * pixel_to_mm_multiplier
-- corrected_target_x = tube_x + correction_x
-- corrected_target_y = tube_y + correction_y
-
-This is why the robot can still land on the tube even when the camera view is slightly off-center or the camera sees the tube shifted in the frame.
-Image pixel Y increases downward, opposite to machine +Y, so the vertical correction reverses the pixel delta.
+The estimate is expressed in millimeters relative to the midpoint camera pose:
+camera X follows gantry +X, camera Y follows image-down (opposite gantry +Y),
+and camera Z is the distance along the optical axis. The camera must remain
+fixed in orientation during the two captures, with its image axes aligned to
+the gantry axes; the intrinsics archive contains no camera-to-gantry rotation.
+The computed Z is reported as a stereo estimate, but pickup continues to use
+the configured `pickup_height_mm` rather than changing motion height.
 
 ## 3. Why there is a safe Z and a pickup Z
 
@@ -71,7 +68,7 @@ The flow is:
 
 - select a tube cell in the rack grid
 - begin a pickup session
-- review the planned coordinates and list of eight steps
+- review the planned coordinates and list of ten steps, including both stereo views
 - run one step at a time with Run Next Step
 - each click calls a step endpoint and performs exactly one action
 
@@ -82,15 +79,19 @@ The runtime keeps a pickup session in memory so the UI can pause mid-sequence in
 The pickup stepper is intentionally explicit. It usually goes in this order:
 
 1. raise to safe Z
-2. move camera to the nominal XY target based on the tube cell
-3. wait for a fresh detection
-4. compute corrected gripper XY and move the gripper there at safe Z
-5. turn vacuum on
-6. move down to pickup_height_mm
-7. lift to scan_height_mm while vacuum stays on
-8. return to the selected tube slot's nominal center XY, lower to pickup_height_mm, release the tube, turn vacuum off, and lift to scan_height_mm
+2. move camera to the left stereo position, X-5 mm
+3. capture and average fresh tube-circle centers
+4. move camera to the right stereo position, X+5 mm
+5. capture the second view and estimate stereo XYZ
+6. move the gripper to stereo-corrected XY at safe Z
+7. turn vacuum on
+8. move down to pickup_height_mm
+9. lift to scan_height_mm while vacuum stays on
+10. return to the selected tube slot's nominal center XY, lower to pickup_height_mm, release the tube, turn vacuum off, and lift to scan_height_mm
 
-The deposit uses the nominal slot center, not the camera-corrected pickup target or camera offset. If step 3 finds no tube center, the sequence stops before the final gripper move. That is the safety check that prevents a bad pickup.
+If either view is missing or the stereo disparity is invalid, the sequence stops
+before the gripper correction and pickup. The deposit still uses the nominal
+slot center, not the camera-corrected pickup target.
 
 ## 6. Safety behavior
 

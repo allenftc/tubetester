@@ -22,3 +22,4 @@ include = ["controller*"]
 
 [tool.setuptools.package-data]
 "controller.web" = ["templates/*.html", "static/*.css", "static/*.js"]
+"controller.vision.tubeLocator" = ["*.npz"]

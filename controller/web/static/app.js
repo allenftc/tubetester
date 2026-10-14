@@ -15,6 +15,7 @@ const state = {
   cameraImageFailed: false,
   cameraPollTimer: null,
   cameraLocateBusy: false,
+  stereoTestBusy: false,
   cameraPickupSession: null,
   cameraPickupPreviewWasEnabled: true,
   clearWatermark: sessionStorage.getItem("console-clear-watermark"),
@@ -280,7 +281,9 @@ function setCapabilities(caps, workflowState) {
   const pickupRunning = state.cameraPickupSession?.state === "running";
   const pickupFailed = state.cameraPickupSession?.state === "failed";
   const pickupLocked = pickupRunning || pickupFailed;
-  el("locate-selected-tube-button").disabled = !caps.send_gcode || !state.selectedTube || state.cameraLocateBusy || pickupRunning;
+  el("stereo-test-button").disabled = !caps.stereo_test || !state.selectedTube || state.cameraLocateBusy || state.stereoTestBusy || pickupLocked;
+  el("stereo-test-button").textContent = state.stereoTestBusy ? "Testing Stereo…" : "Test Stereo Position";
+  el("locate-selected-tube-button").disabled = !caps.send_gcode || !state.selectedTube || state.cameraLocateBusy || state.stereoTestBusy || pickupRunning;
   el("run-next-pickup-step-button").hidden = !pickupRunning;
   el("run-next-pickup-step-button").disabled = state.cameraLocateBusy || !pickupRunning;
   el("cancel-pickup-steps-button").hidden = !pickupRunning && !pickupFailed;
@@ -335,17 +338,20 @@ function renderLocateTubePlan(tube) {
   const camera = rack.camera_offset_mm;
   const cameraX = tube.position_mm.x - camera.x;
   const cameraY = tube.position_mm.y - camera.y;
+  const stereoHalfBaseline = 5;
   const steps = [
     `Raise to safe Z ${number(rack.safe_z_mm)} mm`,
-    `Move camera to X ${number(cameraX)} Y ${number(cameraY)} mm`,
-    "Scan ROI; detect center and calculate pixel correction",
+    `Move camera to left stereo view X ${number(cameraX - stereoHalfBaseline)} Y ${number(cameraY)} mm`,
+    "Capture left stereo image and detect tube circle",
+    `Move camera to right stereo view X ${number(cameraX + stereoHalfBaseline)} Y ${number(cameraY)} mm`,
+    "Capture right stereo image and estimate tube XYZ",
     "Move gripper to corrected tube XY at safe Z",
     "Turn vacuum on",
     `Lower to pickup Z ${number(rack.pickup_height_mm)} mm`,
     `Lift to scan Z ${number(rack.scan_height_mm)} mm; vacuum remains on`,
     "Return to the selected tube slot center, lower, release the tube, turn vacuum off, and lift to scan Z",
   ];
-  setText("locate-tube-plan", `R${tube.row} C${tube.column} plan: camera X ${number(cameraX)} Y ${number(cameraY)} mm; nominal tube XY X ${number(tube.position_mm.x)} Y ${number(tube.position_mm.y)} mm; pixel scale ${number(rack.pixel_to_mm_multiplier)} mm/px.`);
+  setText("locate-tube-plan", `R${tube.row} C${tube.column} plan: stereo camera views at X ${number(cameraX - stereoHalfBaseline)} and ${number(cameraX + stereoHalfBaseline)} mm, Y ${number(cameraY)} mm (10 mm baseline); nominal tube XY X ${number(tube.position_mm.x)} Y ${number(tube.position_mm.y)} mm.`);
   const list = document.createElement("ol");
   steps.forEach(step => { const item = document.createElement("li"); item.textContent = step; list.append(item); });
   el("locate-tube-plan-steps").replaceChildren(...list.children);
@@ -358,13 +364,14 @@ function renderCameraPickupSession(session) {
   session.steps.forEach((step, index) => {
     const item = document.createElement("li");
     item.className = `pickup-step ${classToken(step.state)}`;
-    item.textContent = `${index + 1}. ${step.label} [${step.state}]${step.command && step.command !== "CAMERA_DETECT" && step.command !== "WAITING_FOR_DETECTION" ? ` | ${step.command.replaceAll("\n", " ; ")}` : ""}`;
+    item.textContent = `${index + 1}. ${step.label} [${step.state}]${step.command && !["CAMERA_CAPTURE_LEFT", "CAMERA_CAPTURE_RIGHT", "WAITING_FOR_DETECTION"].includes(step.command) ? ` | ${step.command.replaceAll("\n", " ; ")}` : ""}`;
     list.append(item);
   });
-  if (session.detected_center_px) {
+  if (session.detected_center_px && session.stereo_position_mm && session.correction_mm) {
     const detail = document.createElement("li");
     detail.className = "pickup-step completed";
-    detail.textContent = `Detection: center px (${session.detected_center_px.join(", ")}); correction X ${number(session.correction_mm.x)} Y ${number(session.correction_mm.y)} mm; target X ${number(session.target_xy.x)} Y ${number(session.target_xy.y)} mm.`;
+    const xyz = session.stereo_position_mm;
+    detail.textContent = `Stereo estimate: camera XYZ (${number(xyz.x)}, ${number(xyz.y)}, ${number(xyz.z)}) mm; correction X ${number(session.correction_mm.x)} Y ${number(session.correction_mm.y)} mm; target X ${number(session.target_xy.x)} Y ${number(session.target_xy.y)} mm.`;
     list.append(detail);
   }
   const current = session.steps[session.next_step];
@@ -448,6 +455,7 @@ function wireControls() {
   el("home-button").addEventListener("click", () => act("/api/actions/home"));
   el("preview-button").addEventListener("click", preview);
   el("locate-selected-tube-button").addEventListener("click", beginCameraPickup);
+  el("stereo-test-button").addEventListener("click", runStereoTest);
   el("run-next-pickup-step-button").addEventListener("click", runNextCameraPickupStep);
   el("cancel-pickup-steps-button").addEventListener("click", cancelCameraPickup);
   el("start-button").addEventListener("click", async () => {
@@ -507,6 +515,28 @@ async function beginCameraPickup() {
     if (!state.cameraPickupPreviewWasEnabled && state.cameraEnabled) await setCameraPreviewEnabled(false);
   } finally {
     state.cameraLocateBusy = false;
+    if (state.snapshot) setCapabilities(state.snapshot.capabilities, state.snapshot.workflow.state);
+  }
+}
+
+async function runStereoTest() {
+  if (!state.selectedTube || state.stereoTestBusy) return;
+  const [row, column] = state.selectedTube.split(":").map(Number);
+  state.stereoTestBusy = true;
+  setText("stereo-test-result", `Testing R${row} C${column}: moving through the two stereo positions at safe Z.`);
+  if (state.snapshot) setCapabilities(state.snapshot.capabilities, state.snapshot.workflow.state);
+  try {
+    const result = await api("/api/actions/stereo-test", {row, column});
+    const position = result.position_relative_to_center_mm;
+    setText(
+      "stereo-test-result",
+      `R${row} C${column} relative to scan midpoint: X ${number(position.x)} mm, Y ${number(position.y)} mm, Z ${number(position.z)} mm (10 mm baseline). Camera returned to midpoint; no pickup performed.`,
+    );
+  } catch (error) {
+    setText("stereo-test-result", `Stereo test failed: ${error.message}`);
+    alert(error.message);
+  } finally {
+    state.stereoTestBusy = false;
     if (state.snapshot) setCapabilities(state.snapshot.capabilities, state.snapshot.workflow.state);
   }
 }

@@ -12,6 +12,7 @@ from controller.config.settings import load_settings
 from controller.network.moonraker import MoonrakerResponse
 from controller.web.runtime import RuntimeConflict, RuntimeUnavailable, WorkflowRuntime
 from controller.web.server import create_control_app
+from controller.vision.tubeLocator.tube_locator import triangulate_stereo_circles
 
 
 class FakeMoonraker:
@@ -89,12 +90,24 @@ class FakeCameraPreview:
 
 
 class FakeDetectionCameraPreview(FakeCameraPreview):
-    def __init__(self, detected_center: list[int] | None) -> None:
+    def __init__(
+        self,
+        detected_center: list[float] | None,
+        right_center: list[float] | None = None,
+    ) -> None:
         super().__init__()
-        self.detected_center = detected_center
+        self.detected_centers = [
+            detected_center,
+            right_center if right_center is not None else (
+                [detected_center[0] - 25, detected_center[1]] if detected_center is not None else None
+            ),
+        ]
         self.detection_after_sequence: int | None = None
+        self.capture_count = 0
+        self.frame_after_sequence: int | None = None
 
     def wait_for_frame(self, after_sequence: int, timeout_seconds: float = 5.0) -> tuple[int, bytes | None]:
+        self.frame_after_sequence = after_sequence
         return 1, b"frame"
 
     def wait_for_detection(self, after_sequence: int, timeout_seconds: float = 8.0) -> dict[str, object] | None:
@@ -113,14 +126,18 @@ class FakeDetectionCameraPreview(FakeCameraPreview):
         timeout_seconds: float = 8.0,
     ) -> dict[str, object] | None:
         self.detection_after_sequence = after_sequence
-        if self.detected_center is None:
+        detected_center = self.detected_centers[self.capture_count]
+        self.capture_count += 1
+        if detected_center is None:
             return None
-        offset_x = self.detected_center[0] - 160
-        offset_y = self.detected_center[1] - 120
+        offset_x = detected_center[0] - 160
+        offset_y = detected_center[1] - 120
         return {
-            "detected_center": self.detected_center,
+            "detected_center": detected_center,
             "detected_offset_roi": [float(offset_x), float(offset_y)],
             "roi": {"center_x": 160, "center_y": 120, "width": 80, "height": 80},
+            "width": 320,
+            "height": 240,
             "sample_count": frame_count,
         }
 
@@ -150,6 +167,8 @@ class WebTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn('src="/api/camera/stream"', html)
         self.assertIn('id="locate-tube-plan-steps"', html)
         self.assertIn('id="locate-tube-steps"', html)
+        self.assertIn('id="stereo-test-button"', html)
+        self.assertIn('id="stereo-test-result"', html)
         self.assertNotIn("<pre", html)
         self.assertNotIn("Workflow Preview</h2>", html)
 
@@ -312,6 +331,7 @@ class WebTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(response.status, 200)
             self.assertEqual(payload["action"], "camera.pickup.stepper")
             self.assertEqual(payload["state"], "running")
+            self.assertEqual(camera.frame_after_sequence, 0)
             tube = self.settings.rack.tube_position(1, 2)
             self.assertEqual(payload["tube_xy"], {"x": tube.x, "y": tube.y})
             self.assertEqual(moonraker.commands, [])
@@ -326,13 +346,84 @@ class WebTests(unittest.IsolatedAsyncioTestCase):
             with self.assertRaises(RuntimeConflict):
                 await runtime.start_vacuum()
 
-            for _ in range(7):
+            for _ in range(10):
                 response = await client.post("/api/actions/locate-tube/step", json={"session_id": payload["session_id"]})
                 payload = await response.json()
                 self.assertEqual(response.status, 200)
             self.assertEqual(payload["state"], "completed")
             self.assertEqual(payload["target_xy"], {"x": tube.x, "y": tube.y})
+            self.assertIsNotNone(payload["stereo_position_mm"])
             self.assertTrue((await runtime.snapshot())["capabilities"]["send_gcode"])
+            self.assertFalse(camera.started)
+        finally:
+            await client.close()
+
+    async def test_stereo_test_returns_midpoint_relative_xyz_without_pickup(self) -> None:
+        moonraker = FakeMoonraker(ready=True)
+        runtime = WorkflowRuntime(self.settings, moonraker=moonraker)
+        await runtime.refresh_machine()
+        moonraker.commands.clear()
+        camera = FakeDetectionCameraPreview([170, 115], [145, 115])
+        client = TestClient(TestServer(create_control_app(
+            self.settings,
+            runtime=runtime,
+            camera_preview=camera,  # type: ignore[arg-type]
+            initialize_hardware=False,
+        )))
+        await client.start_server()
+        try:
+            response = await client.post("/api/actions/stereo-test", json={"row": 1, "column": 1})
+            payload = await response.json()
+
+            self.assertEqual(response.status, 200)
+            self.assertEqual(payload["action"], "camera.stereo_test")
+            self.assertEqual(payload["baseline_mm"], 10.0)
+            self.assertEqual(payload["center_xy_mm"], {
+                "x": self.settings.rack.tube_position(0, 0).x - self.settings.rack.camera_offset_mm.x,
+                "y": self.settings.rack.tube_position(0, 0).y - self.settings.rack.camera_offset_mm.y,
+            })
+            expected_position = triangulate_stereo_circles((170, 115), (145, 115), (320, 240))
+            for axis, expected in zip(("x", "y", "z"), expected_position):
+                self.assertAlmostEqual(payload["position_relative_to_center_mm"][axis], expected)
+            center = payload["center_xy_mm"]
+            self.assertEqual(moonraker.commands, [
+                f"G90\nG1 Z{self.settings.rack.safe_z_mm:.3f} F10000\nM400",
+                f"G90\nG1 X{center['x'] - 5:.3f} Y{center['y']:.3f} F10000\nM400",
+                f"G90\nG1 X{center['x'] + 5:.3f} Y{center['y']:.3f} F10000\nM400",
+                f"G90\nG1 X{center['x']:.3f} Y{center['y']:.3f} F10000\nM400",
+            ])
+            self.assertFalse(camera.started)
+            self.assertEqual(camera.detection_mode, "hsv")
+        finally:
+            await client.close()
+
+    async def test_stereo_test_returns_camera_to_midpoint_when_first_circle_is_missing(self) -> None:
+        moonraker = FakeMoonraker(ready=True)
+        runtime = WorkflowRuntime(self.settings, moonraker=moonraker)
+        await runtime.refresh_machine()
+        moonraker.commands.clear()
+        camera = FakeDetectionCameraPreview(None)
+        client = TestClient(TestServer(create_control_app(
+            self.settings,
+            runtime=runtime,
+            camera_preview=camera,  # type: ignore[arg-type]
+            initialize_hardware=False,
+        )))
+        await client.start_server()
+        try:
+            response = await client.post("/api/actions/stereo-test", json={"row": 1, "column": 1})
+            payload = await response.json()
+
+            self.assertEqual(response.status, 503)
+            self.assertIn("left stereo test position", payload["error"]["message"])
+            center = self.settings.rack.tube_position(0, 0)
+            camera_x = center.x - self.settings.rack.camera_offset_mm.x
+            camera_y = center.y - self.settings.rack.camera_offset_mm.y
+            self.assertEqual(moonraker.commands, [
+                f"G90\nG1 Z{self.settings.rack.safe_z_mm:.3f} F10000\nM400",
+                f"G90\nG1 X{camera_x - 5:.3f} Y{camera_y:.3f} F10000\nM400",
+                f"G90\nG1 X{camera_x:.3f} Y{camera_y:.3f} F10000\nM400",
+            ])
             self.assertFalse(camera.started)
         finally:
             await client.close()
@@ -353,7 +444,7 @@ class WebTests(unittest.IsolatedAsyncioTestCase):
         try:
             response = await client.post("/api/actions/locate-tube", json={"row": 1, "column": 1})
             session = await response.json()
-            for _ in range(6):
+            for _ in range(8):
                 response = await client.post("/api/actions/locate-tube/step", json={"session_id": session["session_id"]})
                 session = await response.json()
 
@@ -466,6 +557,7 @@ class RuntimeTests(unittest.IsolatedAsyncioTestCase):
         await runtime.refresh_machine()
         moonraker.commands.clear()
         camera = FakeDetectionCameraPreview([170, 115])
+        expected_stereo_xyz = triangulate_stereo_circles((170, 115), (145, 115), (320, 240))
         tube = settings.rack.tube_position(0, 0)
 
         session = await runtime.begin_camera_pickup(1, 1, camera)  # type: ignore[arg-type]
@@ -473,35 +565,39 @@ class RuntimeTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(session["next_step"], 0)
         self.assertEqual(moonraker.commands, [])
 
-        for step_index in range(8):
+        for step_index in range(10):
             previous_command_count = len(moonraker.commands)
             session = await runtime.run_camera_pickup_step(session["session_id"], camera)  # type: ignore[arg-type]
-            expected_added_commands = 0 if step_index == 2 else 1
+            expected_added_commands = 0 if step_index in {2, 4} else 1
             self.assertEqual(len(moonraker.commands) - previous_command_count, expected_added_commands)
             self.assertEqual(session["next_step"], step_index + 1)
 
         self.assertEqual(session["action"], "camera.pickup.stepper")
         self.assertEqual(session["state"], "completed")
-        self.assertEqual(session["correction_mm"], {
-            "x": 10 * settings.rack.pixel_to_mm_multiplier,
-            "y": 5 * settings.rack.pixel_to_mm_multiplier,
+        self.assertAlmostEqual(session["correction_mm"]["x"], expected_stereo_xyz[0])
+        self.assertAlmostEqual(session["correction_mm"]["y"], -expected_stereo_xyz[1])
+        self.assertEqual(session["stereo_position_mm"], {
+            "x": expected_stereo_xyz[0],
+            "y": expected_stereo_xyz[1],
+            "z": expected_stereo_xyz[2],
         })
         self.assertEqual(moonraker.commands, [
             f"G90\nG1 Z{settings.rack.safe_z_mm:.3f} F10000\nM400",
-            f"G90\nG1 X{tube.x - settings.rack.camera_offset_mm.x:.3f} Y{tube.y - settings.rack.camera_offset_mm.y:.3f} F10000\nM400",
-            f"G90\nG1 X{tube.x + 10 * settings.rack.pixel_to_mm_multiplier:.3f} Y{tube.y + 5 * settings.rack.pixel_to_mm_multiplier:.3f} F5000\nM400",
+            f"G90\nG1 X{tube.x - settings.rack.camera_offset_mm.x - 5:.3f} Y{tube.y - settings.rack.camera_offset_mm.y:.3f} F10000\nM400",
+            f"G90\nG1 X{tube.x - settings.rack.camera_offset_mm.x + 5:.3f} Y{tube.y - settings.rack.camera_offset_mm.y:.3f} F10000\nM400",
+            f"G90\nG1 X{tube.x + expected_stereo_xyz[0]:.3f} Y{tube.y - expected_stereo_xyz[1]:.3f} F5000\nM400",
             "SET_PIN PIN=vacuum_pump VALUE=1",
             f"G90\nG1 Z{settings.rack.pickup_height_mm:.3f} F3000\nM400",
             f"G90\nG1 Z{settings.rack.scan_height_mm:.3f} F5000\nM400",
             "\n".join((
                 f"G90\nG1 X{tube.x:.3f} Y{tube.y:.3f} F5000\nM400",
                 f"G90\nG1 Z{settings.rack.pickup_height_mm:.3f} F3000\nM400",
-                "SET_PIN PIN=solenoid VALUE=1\nG4 P500\nSET_PIN PIN=solenoid VALUE=0",
+                "SET_PIN PIN=solenoid VALUE=1\nG4 P750\nSET_PIN PIN=solenoid VALUE=0",
                 "SET_PIN PIN=vacuum_pump VALUE=0",
                 f"G90\nG1 Z{settings.rack.scan_height_mm:.3f} F5000\nM400",
             )),
         ])
-        self.assertEqual(len(session["steps"]), 8)
+        self.assertEqual(len(session["steps"]), 10)
         self.assertEqual(session["scan_height_mm"], settings.rack.scan_height_mm)
         self.assertTrue(all(step["state"] == "completed" for step in session["steps"]))
         self.assertFalse(session["vacuum_enabled"])
@@ -518,7 +614,7 @@ class RuntimeTests(unittest.IsolatedAsyncioTestCase):
 
         session = await runtime.begin_camera_pickup(1, 1, camera)  # type: ignore[arg-type]
         await runtime.run_camera_pickup_step(session["session_id"], camera)  # safe Z
-        await runtime.run_camera_pickup_step(session["session_id"], camera)  # camera XY
+        await runtime.run_camera_pickup_step(session["session_id"], camera)  # left camera XY
         with self.assertRaisesRegex(RuntimeUnavailable, "No tube center detected"):
             await runtime.run_camera_pickup_step(session["session_id"], camera)
 
@@ -538,7 +634,7 @@ class RuntimeTests(unittest.IsolatedAsyncioTestCase):
         camera = FakeDetectionCameraPreview([160, 120])
         session = await runtime.begin_camera_pickup(1, 1, camera)  # type: ignore[arg-type]
 
-        for _ in range(6):
+        for _ in range(8):
             session = await runtime.run_camera_pickup_step(session["session_id"], camera)  # type: ignore[arg-type]
         self.assertTrue(session["vacuum_enabled"])
 

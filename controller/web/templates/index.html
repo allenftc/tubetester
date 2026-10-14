@@ -119,11 +119,13 @@
       </div>
       <div id="tube-details" class="tube-details" aria-live="polite">Select a tube to inspect its calibrated position and result.</div>
       <div class="controls" style="grid-template-columns:minmax(180px,auto) 1fr;align-items:center;max-width:620px;margin-top:12px">
+        <button id="stereo-test-button" class="secondary" title="Capture a left and right stereo view and report the tube position relative to their midpoint. Does not pick up the tube." disabled>Test Stereo Position</button>
         <button id="locate-selected-tube-button" class="secondary" title="Prepare a camera-guided pickup session." disabled>Begin Pickup Steps</button>
         <button id="run-next-pickup-step-button" class="primary" hidden disabled>Run Next Step</button>
         <button id="cancel-pickup-steps-button" class="danger" hidden disabled>Cancel Steps</button>
         <small id="locate-tube-status" class="muted">Home axes first. Select a rack position to preview its camera and gripper coordinates.</small>
       </div>
+      <p id="stereo-test-result" class="muted" role="status" aria-live="polite">Select a rack position to test its stereo tube position.</p>
       <p id="locate-tube-plan" class="muted" aria-live="polite">Pickup height is configured by pickup_height_mm in rack.json.</p>
       <ol id="locate-tube-plan-steps" class="locate-tube-steps"></ol>
       <ol id="locate-tube-steps" class="locate-tube-steps" aria-live="polite"></ol>
