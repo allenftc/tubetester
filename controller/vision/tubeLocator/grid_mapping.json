@@ -1,0 +1,53 @@
+{
+  "version": 1,
+  "coordinate_units": "mm",
+  "pixel_to_world_homography": [
+    [
+      0.14194266049010226,
+      0.14464619193812078,
+      -53.39927357833438
+    ],
+    [
+      0.14394302993138305,
+      -0.14162951661588674,
+      -32.603382805068826
+    ],
+    [
+      1.0885592886550376e-05,
+      2.1328595733900158e-05,
+      1.0
+    ]
+  ],
+  "world_to_pixel_homography": [
+    [
+      3.427138047272059,
+      3.545101072167533,
+      298.5889695155373
+    ],
+    [
+      3.5089367099750053,
+      -3.465797963597841,
+      74.37793361280745
+    ],
+    [
+      -0.00011214712209150942,
+      3.533007664766375e-05,
+      0.9951633051598888
+    ]
+  ],
+  "checkerboard_inner_corners": [
+    0,
+    0
+  ],
+  "grid_pixel_ids": null,
+  "grid_indices": null,
+  "manual_coordinates_are_absolute": false,
+  "pitch": 20.2,
+  "origin_offset": [
+    0.0,
+    0.0
+  ],
+  "camera_to_board_distance": null,
+  "mean_corner_reprojection_error": 0.28542908553535323,
+  "mapping_scope": "the checkerboard/work-surface plane only"
+}

@@ -1,11 +1,11 @@
 {
-  "origin_mm": {"x": 139, "y": 40, "z": 0.0},
+  "origin_mm": {"x": 138.6, "y": 51.6, "z": 0.0},
   "tube_pitch_mm": {"x": 20.2, "y": 20.2},
   "pickup_offset_mm": {"x": 0.0, "y": 0.0, "z": 4.0},
   "safe_z_mm": 42.0,
   "columns": 6, 
   "rows": 12,
-  "camera_offset_mm": {"x": 21.8, "y": -20.3, "z": 0.0},
+  "camera_offset_mm": {"x": 23.3, "y": -20.8, "z": 0.0},
   "pixel_to_mm_multiplier": 0.425,
   "pickup_height_mm": 28.0,
   "scan_height_mm": 150

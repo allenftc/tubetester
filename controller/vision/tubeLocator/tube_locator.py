@@ -8,12 +8,33 @@ from typing import Optional, Tuple
 
 import cv2
 import numpy as np
+import json
 
 
 Point = Tuple[int, int]
 ROI = Tuple[int, int, int, int]
 Circle = Tuple[int, int, int]
 STEREO_BASELINE_MM = 10.0
+
+CALIBRATION_PATH = Path(__file__).resolve().with_name("grid_mapping.json")
+
+with CALIBRATION_PATH.open("r", encoding="utf-8") as file:
+    calibration = json.load(file)
+
+pixel_to_world = np.array(
+    calibration["pixel_to_world_homography"],
+    dtype=np.float64,
+)
+
+
+def pixel_to_real(pixel_x: float, pixel_y: float) -> tuple[float, float]:
+    pixel = np.array(
+        [[[pixel_x, pixel_y]]],
+        dtype=np.float64,
+    )
+
+    real = cv2.perspectiveTransform(pixel, pixel_to_world)[0, 0]
+    return float(real[0]), float(real[1])
 
 
 def triangulate_stereo_circles(
@@ -242,9 +263,9 @@ class TubeLocator:
 			cv2.HOUGH_GRADIENT,
 			dp=1,
 			minDist=20,
-			param1=150,
-			param2=35,
-			minRadius=10,
+			param1=130,
+			param2=30,
+			minRadius=20,
 			maxRadius=0,
 		)
 		circles: list[Circle] = []
@@ -262,10 +283,8 @@ class TubeLocator:
 
 		center: Optional[Point] = None
 		if circles:
-			center = min(
-				((x, y) for x, y, _ in circles),
-				key=lambda point: (point[0] - center_x) ** 2 + (point[1] - center_y) ** 2,
-			)
+			circle = max(circles, key=lambda c: c[2])
+			center = (circle[0], circle[1])	
 		debug_montage = self._circle_debug_montage(roi_image, gray, blurred, roi_circles)
 		return center, bool(circles), raw_mask, circles, debug_montage
 
@@ -315,28 +334,13 @@ class TubeLocator:
 			cv2.circle(preview, (circle_x, circle_y), 2, (0, 255, 0), -1)
 		cv2.drawMarker(preview, (center_x, center_y), (0, 220, 255), cv2.MARKER_CROSS, 16, 2)
 
-				# Your camera intrinsics
-		K = np.array([[496.16483041, 0., 344.61027747],
-					[0., 494.61583984, 261.16698538],
-					[0., 0., 1.]])
-		K /= 2
-		# 3D point: 10cm forward, 5cm left, 4cm up
-		# Assuming standard camera coordinates:
-		# X: right positive, so left = -5
-		# Y: down positive, so up = -4  
-		# Z: forward positive = 10
-		point_3d = np.array([0, 0, 10.5])  # [X, Y, Z] in cm
-
-		# Project to homogeneous pixel coordinates
-		point_homogeneous = K @ point_3d
-
-		cv2.drawMarker(preview, (345, 261), (255, 0, 0), cv2.MARKER_STAR, 20, 2)
 
 		if center is not None:
 			cv2.drawMarker(preview, center, (0, 0, 255), cv2.MARKER_CROSS, 20, 2)
 		status = "Tube present" if tube_present else "No tube present"
 		if center is not None:
-			status += f"  center ({center[0]}, {center[1]})"
+			real_x, real_y = pixel_to_real(center[0], center[1])
+			status += f"  center ({real_x:.2f}, {real_y:.2f})"
 		cv2.putText(
 			preview,
 			status,
