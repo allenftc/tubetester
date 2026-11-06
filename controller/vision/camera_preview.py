@@ -241,9 +241,9 @@ class CameraPreviewService:
                         circles: list[tuple[int, int, int]] = []
                         debug_montage: np.ndarray | None = None
                         if detection_mode == "hough":
-                            center, tube_present, mask, circles, debug_montage = locator.locate_with_circles(frame, roi)
+                            center, tube_present, color, mask, circles, debug_montage = locator.locate_with_circles(frame, roi)
                         else:
-                            center, tube_present, mask = locator.locate_with_mask(frame, roi)
+                            center, tube_present, color, mask = locator.locate_with_mask(frame, roi)
                         detected_offset_roi = (
                             locator.roi_offset_from_frame_point(center, roi)
                             if detection_mode == "hough" and center is not None
@@ -256,7 +256,7 @@ class CameraPreviewService:
                                 message="The locator could not produce an HSV mask for the camera frame.",
                             )
                             break
-                        preview = locator.annotate(frame, roi, center, tube_present, circles)
+                        preview = locator.annotate(frame, roi, center, tube_present, circles, color=color)
                         encoded, image = cv2.imencode(
                             ".jpg",
                             preview,

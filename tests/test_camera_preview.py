@@ -13,7 +13,7 @@ from controller.vision.camera_preview import (
     PREVIEW_WIDTH,
     CameraPreviewService,
 )
-from controller.vision.tubeLocator.tube_locator import TubeLocator
+from controller.vision.tubeLocator.tube_locator import ColorRange, TubeLocator
 from controller.vision.tubeLocator.tube_locator import triangulate_stereo_circles
 
 
@@ -216,6 +216,84 @@ class CameraPreviewTests(unittest.TestCase):
         self.assertTrue(locate_with_circles.called)
         self.assertEqual(status["detection_mode"], "hough")
 
+
+class ColorClassificationTests(unittest.TestCase):
+    """Ring-sampling cap-colour classification.
+
+    The scenes are a blue plate (the locator's thresholded background) with a
+    coloured cap disc, so the classifier sees a real ROI rather than a flat
+    swatch: it needs background pixels for the relative-brightness rule and a
+    mask to keep its samples on the cap.
+    """
+
+    PLATE = (110, 150, 100)
+    SIZE = 60
+    CAP_RADIUS = 20
+
+    def _hsv_to_bgr(self, hsv):
+        return cv2.cvtColor(np.array([[hsv]], dtype=np.uint8), cv2.COLOR_HSV2BGR)[0, 0]
+
+    def _scene(self, cap_hsv, scale=1.0):
+        cap = (cap_hsv[0], cap_hsv[1], min(255, int(cap_hsv[2] * scale)))
+        frame = np.zeros((self.SIZE, self.SIZE, 3), dtype=np.uint8)
+        frame[:, :] = self._hsv_to_bgr(self.PLATE)
+        yy, xx = np.mgrid[0 : self.SIZE, 0 : self.SIZE]
+        disc = (xx - self.SIZE // 2) ** 2 + (yy - self.SIZE // 2) ** 2 <= self.CAP_RADIUS**2
+        frame[disc] = self._hsv_to_bgr(cap)
+        return frame
+
+    def _classify(self, frame):
+        locator = TubeLocator(show_preview=False, roi_rotation_deg=0, min_contour_area=1)
+        _, _, color, _ = locator.locate_with_mask(frame, (self.SIZE // 2, self.SIZE // 2, self.SIZE, self.SIZE))
+        return color
+
+    def test_each_cap_colour_is_classified_from_a_realistic_roi(self) -> None:
+        cases = {
+            "white": (0, 20, 240),
+            "green": (60, 150, 180),
+            "pink": (165, 120, 200),
+            "red": (5, 150, 200),
+            "gray": (0, 30, 120),
+            "cyan": (90, 150, 200),
+        }
+        for name, hsv in cases.items():
+            with self.subTest(color=name):
+                self.assertEqual(self._classify(self._scene(hsv)), name)
+
+    def test_red_cap_on_the_far_side_of_the_hue_wrap_reads_as_red(self) -> None:
+        # OpenCV hue wraps at 180, so red spans 170-180 and 0-10.
+        self.assertEqual(self._classify(self._scene((175, 150, 200))), "red")
+
+    def test_white_cap_under_dim_light_still_reads_as_white(self) -> None:
+        # Dim light pulls every value down; white is still brighter than its
+        # background, which is what the relative-brightness rule keys on.
+        self.assertEqual(self._classify(self._scene((0, 20, 240), scale=0.6)), "white")
+
+    def test_pale_cap_falls_to_the_chromatic_range_when_both_match(self) -> None:
+        # S=55 sits inside both green and white, so priority decides.
+        self.assertEqual(self._classify(self._scene((60, 55, 210))), "green")
+
+    def test_returns_none_when_the_ring_does_not_agree(self) -> None:
+        frame = np.zeros((self.SIZE, self.SIZE, 3), dtype=np.uint8)
+        frame[:, :] = self._hsv_to_bgr(self.PLATE)
+        yy, xx = np.mgrid[0 : self.SIZE, 0 : self.SIZE]
+        disc = (xx - self.SIZE // 2) ** 2 + (yy - self.SIZE // 2) ** 2 <= self.CAP_RADIUS**2
+        top = disc & (yy < self.SIZE // 2)
+        frame[top] = self._hsv_to_bgr((60, 150, 180))
+        frame[disc & ~top] = self._hsv_to_bgr((0, 20, 240))
+        self.assertIsNone(self._classify(frame))
+
+    def test_returns_none_when_the_ring_is_too_small_to_sample(self) -> None:
+        frame = np.zeros((self.SIZE, self.SIZE, 3), dtype=np.uint8)
+        frame[:, :] = self._hsv_to_bgr(self.PLATE)
+        frame[29:31, 29:31] = self._hsv_to_bgr((60, 150, 180))
+        self.assertIsNone(self._classify(frame))
+
+    def test_hue_distance_wraps_across_the_180_boundary(self) -> None:
+        red = ColorRange("red", (170, 100, 40), (10, 255, 255))
+        self.assertEqual(TubeLocator._hue_distance(red, 175), 0)
+        self.assertEqual(TubeLocator._hue_distance(red, 3), 0)
+        self.assertEqual(TubeLocator._hue_distance(red, 90), 80)
 
 if __name__ == "__main__":
     unittest.main()

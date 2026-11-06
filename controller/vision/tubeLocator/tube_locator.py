@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional, Tuple
 
@@ -15,6 +16,39 @@ Point = Tuple[int, int]
 ROI = Tuple[int, int, int, int]
 Circle = Tuple[int, int, int]
 STEREO_BASELINE_MM = 10.0
+
+
+@dataclass(frozen=True)
+class ColorRange:
+    """HSV range for classifying a tube cap color.
+
+    A hue segment whose lower bound exceeds its upper bound wraps through 180,
+    which is where red sits. ``priority`` breaks ties between ranges that both
+    match a sample; ``relative_value`` lets a range accept pixels that are only
+    bright relative to the ROI background, which is how a white cap reads under
+    dim light.
+    """
+
+    name: str
+    lower: Tuple[int, int, int]
+    upper: Tuple[int, int, int]
+    priority: int = 1
+    relative_value: bool = False
+
+
+NEUTRAL_PRIORITY = 0
+NEUTRAL_RELATIVE_VALUE_GAIN = 1.25
+MIN_SAMPLE_VALUE = 40
+MIN_COLOR_SAMPLES = 8
+
+DEFAULT_COLOR_RANGES: tuple[ColorRange, ...] = (
+    ColorRange("white", (0, 0, 200), (180, 60, 255), priority=NEUTRAL_PRIORITY, relative_value=True),
+    ColorRange("red", (170, 100, MIN_SAMPLE_VALUE), (10, 255, 255)),
+    ColorRange("pink", (140, 50, MIN_SAMPLE_VALUE), (170, 255, 255)),
+    ColorRange("green", (40, 50, MIN_SAMPLE_VALUE), (85, 255, 255)),
+    ColorRange("cyan", (85, 100, MIN_SAMPLE_VALUE), (105, 255, 255)),
+    ColorRange("gray", (0, 0, MIN_SAMPLE_VALUE), (180, 60, 200), priority=NEUTRAL_PRIORITY),
+)
 
 CALIBRATION_PATH = Path(__file__).resolve().with_name("grid_mapping.json")
 
@@ -134,6 +168,7 @@ class TubeLocator:
 		roi_rotation_deg: float = 45.0,
 		presence_scan_fraction: float = 0.3,
 		presence_threshold: float = 0.25,
+		color_ranges: Optional[tuple[ColorRange, ...]] = None,
 	) -> None:
 		if not 0.0 < presence_scan_fraction <= 1.0:
 			raise ValueError("presence_scan_fraction must be in the range (0, 1]")
@@ -149,29 +184,151 @@ class TubeLocator:
 		self.roi_rotation_deg = roi_rotation_deg
 		self.presence_scan_fraction = presence_scan_fraction
 		self.presence_threshold = presence_threshold
+		self.color_ranges = color_ranges if color_ranges is not None else DEFAULT_COLOR_RANGES
 
-	def locate(self, frame: np.ndarray, roi: ROI) -> Tuple[Optional[Point], bool]:
-		"""Return the detected center and whether a tube is present.
+	def _classify_color(
+		self,
+		roi_image: np.ndarray,
+		center: Point,
+		radius: int = 8,
+		samples_mask: Optional[np.ndarray] = None,
+		num_samples: int = 24,
+		min_agreement: float = 0.6,
+	) -> Optional[str]:
+		"""Classify the cap color from samples on a ring at half radius.
+
+		Tubes have black holes in the center, so a solid patch sample lands on the
+		hole. This samples ``num_samples`` points evenly spaced on a ring at half
+		``radius``, keeps only pixels ``samples_mask`` marks as cap, drops samples too
+		dark to be cap (shadow or the hole edge), and averages each sample over its
+		3x3 neighbourhood to damp single-pixel spikes. A range flagged
+		``relative_value`` also accepts pixels that are bright relative to the ROI
+		background, which is how a white cap reads under dim light. Returns the
+		winning range name, or ``None`` when fewer than ``min_agreement`` of the
+		samples agree.
+		"""
+		if not self.color_ranges:
+			return None
+
+		height, width = roi_image.shape[:2]
+		if height < 3 or width < 3:
+			return None
+
+		hsv = cv2.cvtColor(roi_image, cv2.COLOR_BGR2HSV)
+		value_plane = hsv[:, :, 2]
+		cap_mask = samples_mask.astype(bool) if samples_mask is not None else np.ones(
+			(height, width), dtype=bool
+		)
+		background = ~cap_mask
+		background_median = int(np.median(value_plane[background])) if int(background.sum()) else 0
+
+		cx, cy = center
+		ring_radius = min(max(1, int(round(radius * 0.5))), max(1, min(height, width) // 2))
+
+		samples: list[tuple[int, int, int]] = []
+		for index in range(num_samples):
+			angle = 2.0 * np.pi * index / num_samples
+			sx = int(round(cx + ring_radius * np.cos(angle)))
+			sy = int(round(cy + ring_radius * np.sin(angle)))
+			if not (0 <= sx < width and 0 <= sy < height):
+				continue
+			if not cap_mask[sy, sx]:
+				continue
+			y0, y1 = max(0, sy - 1), min(height, sy + 2)
+			x0, x1 = max(0, sx + 1), min(width, sx + 2)
+			sample = tuple(int(v) for v in hsv[y0:y1, x0:x1].mean(axis=(0, 1)))
+			if sample[2] < MIN_SAMPLE_VALUE:
+				continue
+			samples.append(sample)
+
+		if len(samples) < MIN_COLOR_SAMPLES:
+			return None
+
+		best_name: Optional[str] = None
+		best_key = None
+		for color_range in self.color_ranges:
+			value_floor = color_range.lower[2]
+			if color_range.relative_value and background_median:
+				value_floor = min(value_floor, int(background_median * NEUTRAL_RELATIVE_VALUE_GAIN))
+			count = 0
+			hue_distance = 0
+			for hue, saturation, value in samples:
+				if self._color_range_matches(color_range, hue, saturation, value, value_floor):
+					count += 1
+				hue_distance += self._hue_distance(color_range, hue)
+			if count == 0:
+				continue
+			key = (
+				count,
+				color_range.priority,
+				-int(hue_distance / len(samples)),
+				value_floor,
+				color_range.name,
+			)
+			if best_key is None or key > best_key:
+				best_key = key
+				best_name = color_range.name
+
+		if best_name is None or best_key[0] / len(samples) < min_agreement:
+			return None
+		return best_name
+
+	@staticmethod
+	def _color_range_matches(
+		color_range: ColorRange,
+		hue: int,
+		saturation: int,
+		value: int,
+		value_floor: int,
+	) -> bool:
+		"""Return whether one HSV sample falls inside a range, honouring hue wrap."""
+		lower_hue, lower_saturation, lower_value = color_range.lower
+		upper_hue, upper_saturation, upper_value = color_range.upper
+		if lower_hue <= upper_hue:
+			hue_ok = lower_hue <= hue <= upper_hue
+		else:
+			hue_ok = hue >= lower_hue or hue <= upper_hue
+		return (
+			hue_ok
+			and lower_saturation <= saturation <= upper_saturation
+			and value_floor <= value <= upper_value
+		)
+
+	@staticmethod
+	def _hue_distance(color_range: ColorRange, hue: int) -> int:
+		"""Distance from a hue to the nearest edge of the range's hue segment."""
+		lower_hue, _, _ = color_range.lower
+		upper_hue, _, _ = color_range.upper
+		if lower_hue <= upper_hue:
+			if lower_hue <= hue <= upper_hue:
+				return 0
+			return min(abs(hue - lower_hue), abs(hue - upper_hue))
+		if hue >= lower_hue or hue <= upper_hue:
+			return 0
+		return min(hue - upper_hue, lower_hue - hue)
+
+	def locate(self, frame: np.ndarray, roi: ROI) -> Tuple[Optional[Point], bool, Optional[str]]:
+		"""Return the detected center, whether a tube is present, and its cap color.
 
 		Tube presence is gated by the fraction of foreground pixels in a central
 		patch of the inverted ROI mask.
 		"""
-		center, tube_present, _ = self.locate_with_mask(frame, roi)
-		return center, tube_present
+		center, tube_present, color, _ = self.locate_with_mask(frame, roi)
+		return center, tube_present, color
 
 	def locate_with_mask(
 		self,
 		frame: np.ndarray,
 		roi: ROI,
-	) -> Tuple[Optional[Point], bool, Optional[np.ndarray]]:
-		"""Return the detection result and raw HSV threshold mask for the ROI."""
+	) -> Tuple[Optional[Point], bool, Optional[str], Optional[np.ndarray]]:
+		"""Return the detection result, cap color, and raw HSV threshold mask for the ROI."""
 		if frame is None or frame.size == 0:
-			return None, False, None
+			return None, False, None, None
 
 		height, width = frame.shape[:2]
 		center_x, center_y, roi_width, roi_height = roi
 		if roi_width <= 1 or roi_height <= 1:
-			return None, False, None
+			return None, False, None, None
 
 		roi_image, warp = self._warp_roi(frame, roi)
 		rotated_corners = self._rotated_roi_corners(roi)
@@ -211,6 +368,7 @@ class TubeLocator:
 		tube_present = foreground_ratio >= self.presence_threshold
 
 		center: Optional[Point] = None
+		color: Optional[str] = None
 		if tube_present:
 			contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
 			valid = [c for c in contours if cv2.contourArea(c) >= self.min_contour_area]
@@ -227,9 +385,23 @@ class TubeLocator:
 						int(round(float(original_center[0]))),
 						int(round(float(original_center[1]))),
 					)
+					roi_center_point = (
+						int(round(float(roi_center[0, 0, 0]))),
+						int(round(float(roi_center[0, 0, 1]))),
+					)
+					enclosing_center, enclosing_radius = cv2.minEnclosingCircle(contour)
+					color = self._classify_color(
+						roi_image,
+						(
+							int(round(float(enclosing_center[0]))),
+							int(round(float(enclosing_center[1]))),
+						),
+						radius=int(enclosing_radius),
+						samples_mask=mask,
+					)
 
 		if self.show_preview:
-			preview = self.annotate(frame, roi, center, tube_present)
+			preview = self.annotate(frame, roi, center, tube_present, color=color)
 			cv2.imshow(
 				self.preview_window,
 				np.hstack((roi_image, cv2.cvtColor(mask, cv2.COLOR_GRAY2BGR))),
@@ -237,20 +409,20 @@ class TubeLocator:
 			cv2.imshow(f"{self.preview_window} - frame", preview)
 			cv2.waitKey(1)
 
-		return center, tube_present, raw_mask
+		return center, tube_present, color, raw_mask
 
 	def locate_with_circles(
 		self,
 		frame: np.ndarray,
 		roi: ROI,
-	) -> Tuple[Optional[Point], bool, Optional[np.ndarray], list[Circle], Optional[np.ndarray]]:
+	) -> Tuple[Optional[Point], bool, Optional[str], Optional[np.ndarray], list[Circle], Optional[np.ndarray]]:
 		"""Detect circles and return a montage of the intermediate OpenCV Mats."""
 		if frame is None or frame.size == 0:
-			return None, False, None, [], None
+			return None, False, None, None, [], None
 
 		center_x, center_y, roi_width, roi_height = roi
 		if roi_width <= 1 or roi_height <= 1:
-			return None, False, None, [], None
+			return None, False, None, None, [], None
 
 		roi_image, warp = self._warp_roi(frame, roi)
 		hsv = cv2.cvtColor(roi_image, cv2.COLOR_BGR2HSV)
@@ -282,11 +454,14 @@ class TubeLocator:
 				))
 
 		center: Optional[Point] = None
+		color: Optional[str] = None
 		if circles:
-			circle = max(circles, key=lambda c: c[2])
-			center = (circle[0], circle[1])	
+			largest = max(range(len(circles)), key=lambda i: circles[i][2])
+			center = (circles[largest][0], circles[largest][1])
+			roi_circle = roi_circles[largest]
+			color = self._classify_color(roi_image, (roi_circle[0], roi_circle[1]), radius=roi_circle[2])
 		debug_montage = self._circle_debug_montage(roi_image, gray, blurred, roi_circles)
-		return center, bool(circles), raw_mask, circles, debug_montage
+		return center, bool(circles), color, raw_mask, circles, debug_montage
 
 	def roi_offset_from_frame_point(self, point: Point, roi: ROI) -> tuple[float, float]:
 		"""Return a frame point's offset from the ROI center in rotated ROI pixels."""
@@ -318,6 +493,7 @@ class TubeLocator:
 		center: Optional[Point],
 		tube_present: bool,
 		circles: Optional[list[Circle]] = None,
+		color: Optional[str] = None,
 	) -> np.ndarray:
 		"""Draw the rotated ROI, its target center, and any detected center."""
 		center_x, center_y, _, _ = roi
@@ -334,13 +510,14 @@ class TubeLocator:
 			cv2.circle(preview, (circle_x, circle_y), 2, (0, 255, 0), -1)
 		cv2.drawMarker(preview, (center_x, center_y), (0, 220, 255), cv2.MARKER_CROSS, 16, 2)
 
-
 		if center is not None:
 			cv2.drawMarker(preview, center, (0, 0, 255), cv2.MARKER_CROSS, 20, 2)
 		status = "Tube present" if tube_present else "No tube present"
 		if center is not None:
 			real_x, real_y = pixel_to_real(center[0], center[1])
 			status += f"  center ({real_x:.2f}, {real_y:.2f})"
+		if color is not None:
+			status += f"  color: {color}"
 		cv2.putText(
 			preview,
 			status,
@@ -506,9 +683,9 @@ def main() -> None:
 					if not ok:
 						break
 
-					center, tube_present = locator.locate(frame, (160, 120, 60, 60))
+					center, tube_present, color = locator.locate(frame, (160, 120, 60, 60))
 					print(
-						f"Tube present: {tube_present}; center: {center}",
+						f"Tube present: {tube_present}; center: {center}; color: {color}",
 						end="\r",
 						flush=True,
 					)
@@ -524,8 +701,8 @@ def main() -> None:
 				raise FileNotFoundError(f"Could not read image: {args.image}")
 
 			frame = resize_to_480p(frame)
-			center, tube_present = locator.locate(frame, (160, 120, 75, 75))
-			print(f"Tube present: {tube_present}; center: {center}")
+			center, tube_present, color = locator.locate(frame, (160, 120, 75, 75))
+			print(f"Tube present: {tube_present}; center: {center}; color: {color}")
 			while True:
 				key = cv2.waitKey(50) & 0xFF
 				if key in (27, ord("q")):
