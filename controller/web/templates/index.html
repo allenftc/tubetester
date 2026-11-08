@@ -7,7 +7,7 @@
   <title>Tube Tester Control</title>
   <link rel="stylesheet" href="/static/app.css">
   <link rel="stylesheet" href="/static/rack.css">
-  <script src="/static/app.js" defer></script>
+  <script src="/static/app.js?v=3" defer></script>
 </head>
 <body>
   <div id="stale-banner" class="stale-banner" role="status" hidden>Live connection interrupted. Reconnecting…</div>
@@ -65,6 +65,27 @@
           <option value="hough">Hough circles</option>
         </select>
       </label>
+      <div id="hough-tuning" style="display:grid;grid-template-columns:repeat(auto-fit,minmax(240px,1fr));gap:12px;margin-top:12px">
+        <label for="circle-method">
+          Hough algorithm
+          <select id="circle-method" style="width:100%">
+            <option value="gradient">Gradient</option>
+            <option value="gradient_alt">Gradient ALT</option>
+          </select>
+        </label>
+        <label for="circle-min-distance">
+          Minimum circle distance: <span id="circle-min-distance-value">20</span>
+          <input id="circle-min-distance" type="range" min="1" max="100" step="1" value="20" style="width:100%">
+        </label>
+        <label for="circle-edge-threshold">
+          Edge threshold: <span id="circle-edge-threshold-value">34</span>
+          <input id="circle-edge-threshold" type="range" min="1" max="100" step="1" value="34" style="width:100%">
+        </label>
+        <label for="circle-canny-threshold">
+          Canny threshold (`param1`): <span id="circle-canny-threshold-value">130</span>
+          <input id="circle-canny-threshold" type="range" min="50" max="250" step="1" value="130" style="width:100%">
+        </label>
+      </div>
       <div class="camera-feed-grid" style="display:grid;grid-template-columns:repeat(auto-fit,minmax(min(100%,320px),1fr));gap:14px;margin-top:16px">
         <figure style="margin:0;min-width:0">
           <figcaption id="camera-feed-caption" class="muted" style="margin-bottom:6px">Camera + HSV locator overlay</figcaption>

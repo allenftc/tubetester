@@ -42,6 +42,7 @@ def create_control_app(
     app.router.add_get("/api/camera/debug", _camera_debug_stream)
     app.router.add_post("/api/camera/preview", _camera_preview_toggle)
     app.router.add_post("/api/camera/detection-mode", _camera_detection_mode)
+    app.router.add_post("/api/camera/circle-parameters", _camera_circle_parameters)
     app.router.add_post("/api/actions/home", _home)
     app.router.add_post("/api/actions/preview", _preview)
     app.router.add_post("/api/actions/locate-tube", _locate_tube)
@@ -152,6 +153,36 @@ async def _camera_detection_mode(request: web.Request) -> web.Response:
     preview: CameraPreviewService = request.app["camera_preview"]
     preview.set_detection_mode(mode)
     return web.json_response({"ok": True, "detection_mode": mode})
+
+
+async def _camera_circle_parameters(request: web.Request) -> web.Response:
+    body = await _json_body(request)
+    min_distance = body.get("circle_min_distance")
+    edge_threshold = body.get("circle_edge_threshold")
+    canny_threshold = body.get("circle_canny_threshold")
+    method = body.get("circle_method")
+    if isinstance(min_distance, bool) or not isinstance(min_distance, (int, float)):
+        raise ValueError("circle_min_distance must be a number")
+    if isinstance(edge_threshold, bool) or not isinstance(edge_threshold, (int, float)):
+        raise ValueError("circle_edge_threshold must be a number")
+    if isinstance(canny_threshold, bool) or not isinstance(canny_threshold, (int, float)):
+        raise ValueError("circle_canny_threshold must be a number")
+    if method not in {"gradient", "gradient_alt"}:
+        raise ValueError("circle_method must be 'gradient' or 'gradient_alt'")
+    preview: CameraPreviewService = request.app["camera_preview"]
+    preview.set_circle_parameters(
+        min_distance=float(min_distance),
+        edge_threshold=float(edge_threshold),
+        canny_threshold=float(canny_threshold),
+        method=method,
+    )
+    return web.json_response({
+        "ok": True,
+        "circle_min_distance": float(min_distance),
+        "circle_edge_threshold": float(edge_threshold),
+        "circle_canny_threshold": float(canny_threshold),
+        "circle_method": method,
+    })
 
 
 async def _camera_stream(request: web.Request) -> web.StreamResponse:

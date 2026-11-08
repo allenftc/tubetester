@@ -61,6 +61,14 @@ function connectCameraPreview() {
   }
   el("camera-preview-toggle").addEventListener("change", event => setCameraPreviewEnabled(event.target.checked));
   el("camera-detection-mode").addEventListener("change", event => setCameraDetectionMode(event.target.value));
+  for (const id of ["circle-min-distance", "circle-edge-threshold", "circle-canny-threshold"]) {
+    el(id).addEventListener("input", event => {
+      const value = event.currentTarget.value;
+      el(`${id}-value`).textContent = value;
+      setCameraCircleParameters();
+    });
+  }
+  el("circle-method").addEventListener("change", () => setCameraCircleParameters());
   window.addEventListener("pagehide", () => {
     if (state.cameraEnabled) {
       fetch("/api/camera/preview", {
@@ -144,6 +152,23 @@ async function setCameraDetectionMode(mode) {
   }
 }
 
+let circleParameterRequest = Promise.resolve();
+function setCameraCircleParameters() {
+  const minDistance = Number(el("circle-min-distance").value);
+  const edgeThreshold = Number(el("circle-edge-threshold").value);
+  const cannyThreshold = Number(el("circle-canny-threshold").value);
+  const method = el("circle-method").value;
+  circleParameterRequest = circleParameterRequest.then(() => api(
+    "/api/camera/circle-parameters",
+    {
+      circle_min_distance: minDistance,
+      circle_edge_threshold: edgeThreshold,
+      circle_canny_threshold: cannyThreshold,
+      circle_method: method,
+    },
+  )).catch(error => announce(error.message));
+}
+
 function updateCameraDetectionMode(mode) {
   el("camera-detection-mode").value = mode;
   el("camera-feed-caption").textContent = mode === "hough"
@@ -151,6 +176,7 @@ function updateCameraDetectionMode(mode) {
     : "Camera + HSV locator overlay";
   el("camera-mask-stream").parentElement.hidden = mode !== "hsv";
   el("camera-debug-panel").hidden = mode !== "hough";
+  el("hough-tuning").hidden = mode !== "hough";
 }
 
 function setCameraFeed(id, endpoint, visible, retry = false) {
@@ -181,6 +207,19 @@ async function refreshCameraStatus() {
 function renderCameraStatus(status) {
   if (!state.cameraEnabled) return;
   updateCameraDetectionMode(status.detection_mode || "hsv");
+  if (Number.isFinite(Number(status.circle_min_distance))) {
+    el("circle-min-distance").value = status.circle_min_distance;
+    el("circle-min-distance-value").textContent = status.circle_min_distance;
+  }
+  if (Number.isFinite(Number(status.circle_edge_threshold))) {
+    el("circle-edge-threshold").value = status.circle_edge_threshold;
+    el("circle-edge-threshold-value").textContent = status.circle_edge_threshold;
+  }
+  if (Number.isFinite(Number(status.circle_canny_threshold))) {
+    el("circle-canny-threshold").value = status.circle_canny_threshold;
+    el("circle-canny-threshold-value").textContent = status.circle_canny_threshold;
+  }
+  if (status.circle_method) el("circle-method").value = status.circle_method;
   const available = Boolean(status.available);
   const starting = ["starting", "connecting"].includes(status.state);
   setChip("camera-chip", available ? "CAMERA LIVE" : starting ? "CAMERA STARTING" : "CAMERA UNAVAILABLE", available ? "ready" : starting ? "warning" : "error");

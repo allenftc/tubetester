@@ -1,6 +1,6 @@
 {
   "moonraker": {
-    "base_url": "http://10.0.0.105:7125",
+    "base_url": "http://localhost:7125",
     "timeout_seconds": 5.0,
     "api_key": null
   },

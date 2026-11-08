@@ -16,6 +16,8 @@ Point = Tuple[int, int]
 ROI = Tuple[int, int, int, int]
 Circle = Tuple[int, int, int]
 STEREO_BASELINE_MM = 10.0
+HOUGH_GRADIENT = "gradient"
+HOUGH_GRADIENT_ALT = "gradient_alt"
 
 
 @dataclass(frozen=True)
@@ -169,11 +171,23 @@ class TubeLocator:
 		presence_scan_fraction: float = 0.3,
 		presence_threshold: float = 0.25,
 		color_ranges: Optional[tuple[ColorRange, ...]] = None,
+		circle_min_distance: float = 20.0,
+		circle_edge_threshold: float = 34.0,
+		circle_canny_threshold: float = 130.0,
+		circle_method: str = HOUGH_GRADIENT_ALT,
 	) -> None:
 		if not 0.0 < presence_scan_fraction <= 1.0:
 			raise ValueError("presence_scan_fraction must be in the range (0, 1]")
 		if not 0.0 <= presence_threshold <= 1.0:
 			raise ValueError("presence_threshold must be in the range [0, 1]")
+		if circle_min_distance <= 0:
+			raise ValueError("circle_min_distance must be greater than zero")
+		if circle_edge_threshold <= 0:
+			raise ValueError("circle_edge_threshold must be greater than zero")
+		if circle_canny_threshold <= 0:
+			raise ValueError("circle_canny_threshold must be greater than zero")
+		if circle_method not in {HOUGH_GRADIENT, HOUGH_GRADIENT_ALT}:
+			raise ValueError("circle_method must be 'gradient' or 'gradient_alt'")
 
 		self.lower_hsv = np.array(lower_hsv, dtype=np.uint8)
 		self.upper_hsv = np.array(upper_hsv, dtype=np.uint8)
@@ -185,6 +199,10 @@ class TubeLocator:
 		self.presence_scan_fraction = presence_scan_fraction
 		self.presence_threshold = presence_threshold
 		self.color_ranges = color_ranges if color_ranges is not None else DEFAULT_COLOR_RANGES
+		self.circle_min_distance = circle_min_distance
+		self.circle_edge_threshold = circle_edge_threshold
+		self.circle_canny_threshold = circle_canny_threshold
+		self.circle_method = circle_method
 
 	def _classify_color(
 		self,
@@ -427,23 +445,42 @@ class TubeLocator:
 		roi_image, warp = self._warp_roi(frame, roi)
 		hsv = cv2.cvtColor(roi_image, cv2.COLOR_BGR2HSV)
 		raw_mask = cv2.inRange(hsv, self.lower_hsv, self.upper_hsv)
+		mask = raw_mask.copy()
+		if self.invert_mask:
+			mask = cv2.bitwise_not(mask)
+		kernel = np.ones((3, 3), np.uint8)
+		mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel)
+		mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel)
 		gray = cv2.cvtColor(roi_image, cv2.COLOR_BGR2GRAY)
-		blurred = cv2.GaussianBlur(gray, (9, 9), 1.5)
-		min_radius = max(2, min(roi_width, roi_height) // 20)
+		denoised = cv2.medianBlur(gray, 5)
+		blurred = cv2.GaussianBlur(denoised, (9, 9), 1)
+		hough_input = cv2.bitwise_and(blurred, blurred, mask=mask)
+		min_radius = max(2, min(roi_width, roi_height) // 12)
+		max_radius = max(min_radius, min(roi_width, roi_height) // 2)
+		method = (
+			cv2.HOUGH_GRADIENT_ALT
+			if self.circle_method == HOUGH_GRADIENT_ALT
+			else cv2.HOUGH_GRADIENT
+		)
+		param2 = 0.90 if self.circle_method == HOUGH_GRADIENT_ALT else self.circle_edge_threshold
 		detected = cv2.HoughCircles(
-			blurred,
-			cv2.HOUGH_GRADIENT,
-			dp=1,
-			minDist=20,
-			param1=130,
-			param2=30,
-			minRadius=20,
-			maxRadius=0,
+			hough_input,
+			method,
+			dp=1.5 if self.circle_method == HOUGH_GRADIENT_ALT else 1,
+			minDist=self.circle_min_distance,
+			param1=self.circle_canny_threshold,
+			param2=param2,
+			minRadius=min_radius,
+			maxRadius=max_radius,
 		)
 		circles: list[Circle] = []
 		roi_circles: list[Circle] = []
 		if detected is not None:
-			for x, y, radius in np.rint(detected[0]).astype(int):
+			detected_circles = [
+				(tuple(int(value) for value in circle))
+				for circle in np.rint(detected[0]).astype(int)
+			]
+			for x, y, radius in self._suppress_inner_circles(detected_circles):
 				roi_circles.append((int(x), int(y), int(radius)))
 				roi_circle = np.array([[[float(x), float(y)]]], dtype=np.float32)
 				frame_circle = cv2.perspectiveTransform(roi_circle, np.linalg.inv(warp))[0, 0]
@@ -456,12 +493,50 @@ class TubeLocator:
 		center: Optional[Point] = None
 		color: Optional[str] = None
 		if circles:
-			largest = max(range(len(circles)), key=lambda i: circles[i][2])
-			center = (circles[largest][0], circles[largest][1])
-			roi_circle = roi_circles[largest]
-			color = self._classify_color(roi_image, (roi_circle[0], roi_circle[1]), radius=roi_circle[2])
-		debug_montage = self._circle_debug_montage(roi_image, gray, blurred, roi_circles)
+			best_index = max(
+				range(len(circles)),
+				key=lambda i: self._circle_score(blurred, roi_circles[i]),
+			)
+			center = (circles[best_index][0], circles[best_index][1])
+			roi_circle = roi_circles[best_index]
+			# color = self._classify_color(roi_image, (roi_circle[0], roi_circle[1]), radius=roi_circle[2])
+		debug_montage = self._circle_debug_montage(roi_image, gray, hough_input, roi_circles)
 		return center, bool(circles), color, raw_mask, circles, debug_montage
+
+	@staticmethod
+	def _suppress_inner_circles(circles: list[Circle]) -> list[Circle]:
+		"""Keep the larger circle when detections are nearly concentric."""
+		kept: list[Circle] = []
+		for candidate in sorted(circles, key=lambda circle: circle[2], reverse=True):
+			cx, cy, radius = candidate
+			is_inner_detection = any(
+				(cx - kept_x) ** 2 + (cy - kept_y) ** 2
+				<= (kept_radius * 0.6) ** 2
+				for kept_x, kept_y, kept_radius in kept
+			)
+			if not is_inner_detection:
+				kept.append(candidate)
+		return kept
+
+	@staticmethod
+	def _circle_score(image: np.ndarray, circle: Circle) -> float:
+		"""Score how strongly an image supports a circle's circumference."""
+		height, width = image.shape[:2]
+		cx, cy, radius = circle
+		angles = np.linspace(0.0, 2.0 * np.pi, 72, endpoint=False)
+		support = 0
+		samples = 0
+		for angle in angles:
+			x = int(round(cx + radius * np.cos(angle)))
+			y = int(round(cy + radius * np.sin(angle)))
+			if not (1 <= x < width - 1 and 1 <= y < height - 1):
+				continue
+			gradient_x = int(image[y, x + 1]) - int(image[y, x - 1])
+			gradient_y = int(image[y + 1, x]) - int(image[y - 1, x])
+			if gradient_x * gradient_x + gradient_y * gradient_y >= 35 * 35:
+				support += 1
+			samples += 1
+		return support / samples if samples else 0.0
 
 	def roi_offset_from_frame_point(self, point: Point, roi: ROI) -> tuple[float, float]:
 		"""Return a frame point's offset from the ROI center in rotated ROI pixels."""

@@ -3,13 +3,14 @@ from __future__ import annotations
 import sys
 import threading
 import time
+from collections import deque
 from typing import Any
 
 import cv2
 import numpy as np
 
 from controller.config.settings import CameraSettings
-from controller.vision.tubeLocator.tube_locator import TubeLocator
+from controller.vision.tubeLocator.tube_locator import HOUGH_GRADIENT, TubeLocator
 
 
 PREVIEW_WIDTH = 640
@@ -32,7 +33,11 @@ class CameraPreviewService:
         self._jpeg: bytes | None = None
         self._mask_jpeg: bytes | None = None
         self._debug_jpeg: bytes | None = None
-        self._detection_mode = "hsv"
+        self._detection_mode = "hough"
+        self._circle_min_distance = 20.0
+        self._circle_edge_threshold = 34.0
+        self._circle_canny_threshold = 130.0
+        self._circle_method = "gradient_alt"
         self._status: dict[str, Any] = {
             "available": False,
             "state": "not_started",
@@ -45,6 +50,10 @@ class CameraPreviewService:
             "detected_offset_roi": None,
             "tube_present": False,
             "detection_mode": self._detection_mode,
+            "circle_min_distance": self._circle_min_distance,
+            "circle_edge_threshold": self._circle_edge_threshold,
+            "circle_canny_threshold": self._circle_canny_threshold,
+            "circle_method": self._circle_method,
             "sequence": 0,
         }
 
@@ -105,6 +114,33 @@ class CameraPreviewService:
         with self._condition:
             self._detection_mode = mode
             self._status["detection_mode"] = mode
+            self._condition.notify_all()
+
+    def set_circle_parameters(
+        self,
+        *,
+        min_distance: float,
+        edge_threshold: float,
+        canny_threshold: float,
+        method: str,
+    ) -> None:
+        if not 1.0 <= min_distance <= 100.0:
+            raise ValueError("circle_min_distance must be between 1 and 100")
+        if not 1.0 <= edge_threshold <= 100.0:
+            raise ValueError("circle_edge_threshold must be between 1 and 100")
+        if not 50.0 <= canny_threshold <= 250.0:
+            raise ValueError("circle_canny_threshold must be between 50 and 250")
+        if method not in {"gradient", "gradient_alt"}:
+            raise ValueError("circle_method must be 'gradient' or 'gradient_alt'")
+        with self._condition:
+            self._circle_min_distance = min_distance
+            self._circle_edge_threshold = edge_threshold
+            self._circle_canny_threshold = canny_threshold
+            self._circle_method = method
+            self._status["circle_min_distance"] = min_distance
+            self._status["circle_edge_threshold"] = edge_threshold
+            self._status["circle_canny_threshold"] = canny_threshold
+            self._status["circle_method"] = method
             self._condition.notify_all()
 
     def wait_for_frame(self, after_sequence: int, timeout_seconds: float = 5.0) -> tuple[int, bytes | None]:
@@ -206,6 +242,9 @@ class CameraPreviewService:
 
     def _capture_loop(self) -> None:
         locator = TubeLocator(show_preview=False, roi_rotation_deg=self.settings.roi_rotation_deg)
+        center_history: deque[tuple[int, int]] = deque(maxlen=9)
+        radius_history: deque[int] = deque(maxlen=9)
+        previous_detection_mode = "hsv"
         try:
             while not self._stop_event.is_set():
                 capture = self._open_capture()
@@ -223,6 +262,8 @@ class CameraPreviewService:
                     self._capture = capture
                     self._status.update(available=True, state="connecting", message="Camera opened; waiting for frames.")
                     self._condition.notify_all()
+                center_history.clear()
+                radius_history.clear()
                 try:
                     while not self._stop_event.is_set():
                         frame_started = time.monotonic()
@@ -238,12 +279,48 @@ class CameraPreviewService:
                         frame, roi = self._prepare_preview_frame(frame)
                         with self._condition:
                             detection_mode = self._detection_mode
+                            locator.circle_min_distance = self._circle_min_distance
+                            locator.circle_edge_threshold = self._circle_edge_threshold
+                            locator.circle_canny_threshold = self._circle_canny_threshold
+                            locator.circle_method = self._circle_method
+                        if detection_mode != previous_detection_mode:
+                            center_history.clear()
+                            radius_history.clear()
+                            previous_detection_mode = detection_mode
                         circles: list[tuple[int, int, int]] = []
                         debug_montage: np.ndarray | None = None
+                        raw_center: tuple[int, int] | None = None
                         if detection_mode == "hough":
                             center, tube_present, color, mask, circles, debug_montage = locator.locate_with_circles(frame, roi)
+                            raw_center = center
                         else:
                             center, tube_present, color, mask = locator.locate_with_mask(frame, roi)
+                        if detection_mode == "hough":
+                            if center is None:
+                                center_history.clear()
+                                radius_history.clear()
+                            else:
+                                center_history.append(center)
+                                center = (
+                                    int(round(float(np.median([point[0] for point in center_history])))),
+                                    int(round(float(np.median([point[1] for point in center_history])))),
+                                )
+                                if circles and raw_center is not None:
+                                    selected_index = min(
+                                        range(len(circles)),
+                                        key=lambda index: (
+                                            circles[index][0] - raw_center[0]
+                                        ) ** 2 + (
+                                            circles[index][1] - raw_center[1]
+                                        ) ** 2,
+                                    )
+                                    selected_circle = circles[selected_index]
+                                    radius_history.append(selected_circle[2])
+                                    circles[selected_index] = (
+                                        center[0],
+                                        center[1],
+                                        int(round(float(np.median(radius_history)))),
+                                    )
                         detected_offset_roi = (
                             locator.roi_offset_from_frame_point(center, roi)
                             if detection_mode == "hough" and center is not None
