@@ -38,6 +38,8 @@ class CameraPreviewService:
         self._circle_edge_threshold = 34.0
         self._circle_canny_threshold = 130.0
         self._circle_method = "gradient_alt"
+        self._record_color_range = False
+        self._recorded_color_range: dict[str, float | int] | None = None
         self._status: dict[str, Any] = {
             "available": False,
             "state": "not_started",
@@ -49,12 +51,15 @@ class CameraPreviewService:
             "detected_center": None,
             "detected_offset_roi": None,
             "tube_present": False,
+            "detected_color": None,
             "detection_mode": self._detection_mode,
             "circle_min_distance": self._circle_min_distance,
             "circle_edge_threshold": self._circle_edge_threshold,
             "circle_canny_threshold": self._circle_canny_threshold,
             "circle_method": self._circle_method,
             "sequence": 0,
+            "color_range_recording": False,
+            "color_range": None,
         }
 
     def start(self) -> None:
@@ -94,6 +99,21 @@ class CameraPreviewService:
                 self._set_status(available=False, state="stopped", message="Camera preview is off.")
             else:
                 self._set_status(available=False, state="stopping", message="Stopping camera preview.")
+
+    def set_color_range_recording(self, recording: bool) -> None:
+        with self._condition:
+            self._record_color_range = recording
+            if recording:
+                self._recorded_color_range = None
+            self._status["color_range_recording"] = recording
+            self._status["color_range"] = self._recorded_color_range
+            self._condition.notify_all()
+
+    def reset_color_range_recording(self) -> None:
+        with self._condition:
+            self._recorded_color_range = None
+            self._status["color_range"] = None
+            self._condition.notify_all()
 
     def status(self) -> dict[str, Any]:
         with self._condition:
@@ -194,16 +214,23 @@ class CameraPreviewService:
         after_sequence: int,
         frame_count: int = 10,
         timeout_seconds: float = 8.0,
+        require_color: bool = False,
+        color_frame_count: int = 3,
     ) -> dict[str, Any] | None:
-        """Average valid Hough centers and rotated-ROI offsets over fresh frames."""
+        """Average fresh detections and optionally require a stable color."""
         if frame_count <= 0:
             raise ValueError("frame_count must be greater than zero")
+        if color_frame_count <= 0:
+            raise ValueError("color_frame_count must be greater than zero")
         deadline = time.monotonic() + timeout_seconds
         center_samples: list[tuple[float, float]] = []
         offset_samples: list[tuple[float, float]] = []
+        color_samples: list[str] = []
         sequence = after_sequence
         with self._condition:
-            while len(center_samples) < frame_count:
+            while len(center_samples) < frame_count or (
+                require_color and len(color_samples) < color_frame_count
+            ):
                 remaining = deadline - time.monotonic()
                 if remaining <= 0 or self._status["state"] in {"unavailable", "error", "stopped"}:
                     return None
@@ -222,6 +249,9 @@ class CameraPreviewService:
                     center_samples.append((float(center[0]), float(center[1])))
                 if offset is not None:
                     offset_samples.append((float(offset[0]), float(offset[1])))
+                color = self._status.get("detected_color")
+                if isinstance(color, str) and color:
+                    color_samples.append(color)
 
             average_center = (
                 sum(point[0] for point in center_samples) / len(center_samples),
@@ -231,14 +261,51 @@ class CameraPreviewService:
                 sum(point[0] for point in offset_samples) / len(offset_samples),
                 sum(point[1] for point in offset_samples) / len(offset_samples),
             ) if offset_samples else None
+            detected_color = max(set(color_samples), key=color_samples.count) if color_samples else None
             return {
                 **self._status,
                 "roi": dict(self._status["roi"]),
                 "detected_center": list(average_center),
                 "detected_offset_roi": list(average_offset) if average_offset is not None else None,
                 "sample_count": len(center_samples),
+                "color_sample_count": len(color_samples),
+                "detected_color": detected_color,
                 "sequence": sequence,
             }
+
+    def _update_color_range(self, sample: dict[str, float | int] | None) -> None:
+        if sample is None:
+            return
+        with self._condition:
+            if not self._record_color_range:
+                return
+            if self._recorded_color_range is None:
+                self._recorded_color_range = dict(sample)
+            else:
+                for key in (
+                    "hue_min",
+                    "saturation_min",
+                    "value_min",
+                ):
+                    self._recorded_color_range[key] = min(
+                        float(self._recorded_color_range[key]),
+                        float(sample[key]),
+                    )
+                for key in (
+                    "hue_max",
+                    "saturation_max",
+                    "value_max",
+                ):
+                    self._recorded_color_range[key] = max(
+                        float(self._recorded_color_range[key]),
+                        float(sample[key]),
+                    )
+                self._recorded_color_range["sample_count"] = (
+                    int(self._recorded_color_range["sample_count"])
+                    + int(sample["sample_count"])
+                )
+            self._status["color_range"] = dict(self._recorded_color_range)
+            self._condition.notify_all()
 
     def _capture_loop(self) -> None:
         locator = TubeLocator(show_preview=False, roi_rotation_deg=self.settings.roi_rotation_deg)
@@ -295,6 +362,7 @@ class CameraPreviewService:
                             raw_center = center
                         else:
                             center, tube_present, color, mask = locator.locate_with_mask(frame, roi)
+                        self._update_color_range(locator.last_color_stats)
                         if detection_mode == "hough":
                             if center is None:
                                 center_history.clear()
@@ -333,7 +401,15 @@ class CameraPreviewService:
                                 message="The locator could not produce an HSV mask for the camera frame.",
                             )
                             break
-                        preview = locator.annotate(frame, roi, center, tube_present, circles, color=color)
+                        preview = locator.annotate(
+                            frame,
+                            roi,
+                            center,
+                            tube_present,
+                            circles,
+                            color=color,
+                            color_radius=locator.last_color_radius,
+                        )
                         encoded, image = cv2.imencode(
                             ".jpg",
                             preview,
@@ -375,6 +451,7 @@ class CameraPreviewService:
                                 height=PREVIEW_HEIGHT,
                                 roi=self._roi_status(roi),
                                 detected_center=center,
+                                detected_color=color,
                                 detected_offset_roi=detected_offset_roi,
                                 tube_present=tube_present,
                                 sequence=self._sequence,

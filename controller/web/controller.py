@@ -186,6 +186,7 @@ class WorkflowController(MachineActions, CameraPickupActions, WorkflowControlAct
                 "pixel_to_mm_multiplier": self.settings.rack.pixel_to_mm_multiplier,
                 "pickup_height_mm": self.settings.rack.pickup_height_mm,
                 "scan_height_mm": self.settings.rack.scan_height_mm,
+                "scan_height_with_offset_mm": self.settings.rack.scan_height_with_offset_mm,
                 "tubes": tubes,
             },
             "capabilities": capabilities,

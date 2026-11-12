@@ -88,6 +88,24 @@ class CameraPreviewTests(unittest.TestCase):
         self.assertTrue(circles)
         self.assertEqual(debug.shape, (320, 320, 3))
 
+    def test_hough_detector_falls_back_to_segmented_circle(self) -> None:
+        frame = np.zeros((100, 100, 3), dtype=np.uint8)
+        cv2.circle(frame, (50, 50), 20, (255, 255, 255), -1)
+        locator = TubeLocator(
+            show_preview=False,
+            roi_rotation_deg=0,
+            lower_hsv=(0, 0, 200),
+            upper_hsv=(180, 255, 255),
+            invert_mask=False,
+        )
+
+        with patch("controller.vision.tubeLocator.tube_locator.cv2.HoughCircles", return_value=None):
+            center, tube_present, _, circles, _, _ = locator.locate_with_circles(frame, (50, 50, 80, 80))
+
+        self.assertTrue(tube_present)
+        self.assertIsNotNone(center)
+        self.assertTrue(circles)
+
     def test_stereo_triangulation_uses_calibration_and_scaled_image_dimensions(self) -> None:
         calibration = np.load(
             Path(__file__).resolve().parents[1] / "controller/vision/tubeLocator/camera_calibration.npz"
@@ -249,12 +267,12 @@ class ColorClassificationTests(unittest.TestCase):
 
     def test_each_cap_colour_is_classified_from_a_realistic_roi(self) -> None:
         cases = {
-            "white": (0, 20, 240),
-            "green": (60, 150, 180),
-            "pink": (165, 120, 200),
-            "red": (5, 150, 200),
             "gray": (0, 30, 120),
-            "cyan": (90, 150, 200),
+            "white": (0, 20, 240),
+            "red": (5, 150, 200),
+            "purple": (150, 120, 200),
+            "teal": (90, 150, 120),
+            "light teal": (90, 90, 210),
         }
         for name, hsv in cases.items():
             with self.subTest(color=name):
@@ -269,11 +287,10 @@ class ColorClassificationTests(unittest.TestCase):
         # background, which is what the relative-brightness rule keys on.
         self.assertEqual(self._classify(self._scene((0, 20, 240), scale=0.6)), "white")
 
-    def test_pale_cap_falls_to_the_chromatic_range_when_both_match(self) -> None:
-        # S=55 sits inside both green and white, so priority decides.
-        self.assertEqual(self._classify(self._scene((60, 55, 210))), "green")
+    def test_pale_cap_is_classified_as_white(self) -> None:
+        self.assertEqual(self._classify(self._scene((90, 55, 210))), "white")
 
-    def test_returns_none_when_the_ring_does_not_agree(self) -> None:
+    def test_average_ring_color_is_used_when_ring_contains_two_colors(self) -> None:
         frame = np.zeros((self.SIZE, self.SIZE, 3), dtype=np.uint8)
         frame[:, :] = self._hsv_to_bgr(self.PLATE)
         yy, xx = np.mgrid[0 : self.SIZE, 0 : self.SIZE]
@@ -281,7 +298,7 @@ class ColorClassificationTests(unittest.TestCase):
         top = disc & (yy < self.SIZE // 2)
         frame[top] = self._hsv_to_bgr((60, 150, 180))
         frame[disc & ~top] = self._hsv_to_bgr((0, 20, 240))
-        self.assertIsNone(self._classify(frame))
+        self.assertEqual(self._classify(frame), "white")
 
     def test_returns_none_when_the_ring_is_too_small_to_sample(self) -> None:
         frame = np.zeros((self.SIZE, self.SIZE, 3), dtype=np.uint8)
@@ -290,7 +307,7 @@ class ColorClassificationTests(unittest.TestCase):
         self.assertIsNone(self._classify(frame))
 
     def test_hue_distance_wraps_across_the_180_boundary(self) -> None:
-        red = ColorRange("red", (170, 100, 40), (10, 255, 255))
+        red = ColorRange("red", (340, 39, 16), (12, 100, 100))
         self.assertEqual(TubeLocator._hue_distance(red, 175), 0)
         self.assertEqual(TubeLocator._hue_distance(red, 3), 0)
         self.assertEqual(TubeLocator._hue_distance(red, 90), 80)

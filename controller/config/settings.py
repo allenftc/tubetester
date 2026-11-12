@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Mapping
 
 
 @dataclass(frozen=True)
@@ -34,6 +35,9 @@ class RackSettings:
     pickup_height_mm: float
     safe_z_mm: float
     scan_height_mm: float
+    scan_height_with_offset_mm: float
+    post_pickup_height_mm: float
+    pickup_height_offset_mm_by_color: Mapping[str, float]
     columns: int = 1
     rows: int = 1
 
@@ -43,6 +47,16 @@ class RackSettings:
             y=self.origin_mm.y + self.pickup_offset_mm.y + self.tube_pitch_mm.y * row,
             z=self.origin_mm.z + self.pickup_offset_mm.z,
         )
+
+    def pickup_height_for_color(self, color: str | None) -> float:
+        """Return rack pickup height plus the selected color's Z offset."""
+        offset = 0.0 if color is None else self.pickup_height_offset_mm_by_color.get(color, 0.0)
+        return self.pickup_height_mm + offset
+
+    def calibrated_scan_height_for_color(self, color: str | None) -> float:
+        """Return the offset calibration height for the selected color."""
+        offset = 0.0 if color is None else self.pickup_height_offset_mm_by_color.get(color, 0.0)
+        return self.scan_height_with_offset_mm + offset
 
 
 @dataclass(frozen=True)
@@ -114,18 +128,35 @@ def load_settings(config_dir: Path) -> ControllerSettings:
     camera_data = _read_json(config_dir / "camera.json")
     network_data = _read_json(config_dir / "network.json")
 
+    pickup_height_mm = float(rack_data.get(
+        "pickup_height_mm",
+        float(rack_data["origin_mm"]["z"]) + float(rack_data["pickup_offset_mm"]["z"]),
+    ))
+    configured_offsets = rack_data.get("pickup_height_offset_mm_by_color", {})
+    if not isinstance(configured_offsets, dict):
+        raise ValueError("rack.json pickup_height_offset_mm_by_color must be an object")
+    pickup_height_offset_mm_by_color = {
+        str(color): float(height)
+        for color, height in configured_offsets.items()
+    }
     rack = RackSettings(
         origin_mm=_point3d(rack_data["origin_mm"]),
         tube_pitch_mm=_point2d(rack_data["tube_pitch_mm"]),
         pickup_offset_mm=_point3d(rack_data["pickup_offset_mm"]),
         camera_offset_mm=_point3d(rack_data.get("camera_offset_mm", {"x": 0, "y": 0, "z": 0})),
         pixel_to_mm_multiplier=float(rack_data.get("pixel_to_mm_multiplier", 0.1)),
-        pickup_height_mm=float(rack_data.get(
-            "pickup_height_mm",
-            float(rack_data["origin_mm"]["z"]) + float(rack_data["pickup_offset_mm"]["z"]),
-        )),
+        pickup_height_mm=pickup_height_mm,
         safe_z_mm=float(rack_data["safe_z_mm"]),
         scan_height_mm=float(rack_data.get("scan_height_mm", rack_data["safe_z_mm"])),
+        scan_height_with_offset_mm=float(rack_data.get(
+            "scan_height_with_offset",
+            rack_data.get("scan_height_mm", rack_data["safe_z_mm"]),
+        )),
+        post_pickup_height_mm=float(rack_data.get(
+            "post_pickup_height_mm",
+            rack_data.get("scan_height_mm", rack_data["safe_z_mm"]),
+        )),
+        pickup_height_offset_mm_by_color=pickup_height_offset_mm_by_color,
         columns=int(rack_data.get("columns", 1)),
         rows=int(rack_data.get("rows", 1)),
     )

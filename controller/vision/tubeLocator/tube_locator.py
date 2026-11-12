@@ -24,32 +24,29 @@ HOUGH_GRADIENT_ALT = "gradient_alt"
 class ColorRange:
     """HSV range for classifying a tube cap color.
 
-    A hue segment whose lower bound exceeds its upper bound wraps through 180,
-    which is where red sits. ``priority`` breaks ties between ranges that both
-    match a sample; ``relative_value`` lets a range accept pixels that are only
-    bright relative to the ROI background, which is how a white cap reads under
-    dim light.
+    Hue uses degrees from 0 to 360, while saturation and value use percentages
+    from 0 to 100. Hue wraps when ``lower`` exceeds ``upper``; this represents red
+    crossing the hue boundary. The values are scaled to OpenCV's HSV ranges only
+    when matching a sample.
     """
 
     name: str
-    lower: Tuple[int, int, int]
-    upper: Tuple[int, int, int]
+    lower: Tuple[float, float, float]
+    upper: Tuple[float, float, float]
     priority: int = 1
     relative_value: bool = False
 
 
-NEUTRAL_PRIORITY = 0
-NEUTRAL_RELATIVE_VALUE_GAIN = 1.25
-MIN_SAMPLE_VALUE = 40
 MIN_COLOR_SAMPLES = 8
+COLOR_NAMES = ("gray", "white", "red", "purple", "green", "light teal")
 
 DEFAULT_COLOR_RANGES: tuple[ColorRange, ...] = (
-    ColorRange("white", (0, 0, 200), (180, 60, 255), priority=NEUTRAL_PRIORITY, relative_value=True),
-    ColorRange("red", (170, 100, MIN_SAMPLE_VALUE), (10, 255, 255)),
-    ColorRange("pink", (140, 50, MIN_SAMPLE_VALUE), (170, 255, 255)),
-    ColorRange("green", (40, 50, MIN_SAMPLE_VALUE), (85, 255, 255)),
-    ColorRange("cyan", (85, 100, MIN_SAMPLE_VALUE), (105, 255, 255)),
-    ColorRange("gray", (0, 0, MIN_SAMPLE_VALUE), (180, 60, 200), priority=NEUTRAL_PRIORITY),
+    ColorRange("white", (0, 5, 40), (35, 40, 100), priority=1, relative_value=True),
+    ColorRange("red", (0, 35, 80), (20, 100, 100), priority=2),
+    ColorRange("purple", (300, 25, 50), (360, 100, 100), priority=2),
+    ColorRange("green", (160, 67, 15), (200, 100, 55), priority=2),
+    ColorRange("light teal", (105, 5, 50), (170, 35, 100), priority=3),
+    ColorRange("gray", (0, 0, 0), (360, 40, 70), priority=1),
 )
 
 CALIBRATION_PATH = Path(__file__).resolve().with_name("grid_mapping.json")
@@ -203,6 +200,8 @@ class TubeLocator:
 		self.circle_edge_threshold = circle_edge_threshold
 		self.circle_canny_threshold = circle_canny_threshold
 		self.circle_method = circle_method
+		self.last_color_stats: Optional[dict[str, float | int]] = None
+		self.last_color_radius: Optional[int] = None
 
 	def _classify_color(
 		self,
@@ -213,83 +212,84 @@ class TubeLocator:
 		num_samples: int = 24,
 		min_agreement: float = 0.6,
 	) -> Optional[str]:
-		"""Classify the cap color from samples on a ring at half radius.
+		"""Classify the average color in an annulus centered on the tube.
 
-		Tubes have black holes in the center, so a solid patch sample lands on the
-		hole. This samples ``num_samples`` points evenly spaced on a ring at half
-		``radius``, keeps only pixels ``samples_mask`` marks as cap, drops samples too
-		dark to be cap (shadow or the hole edge), and averages each sample over its
-		3x3 neighbourhood to damp single-pixel spikes. A range flagged
-		``relative_value`` also accepts pixels that are bright relative to the ROI
-		background, which is how a white cap reads under dim light. Returns the
-		winning range name, or ``None`` when fewer than ``min_agreement`` of the
-		samples agree.
-		"""
-		if not self.color_ranges:
-			return None
-
+	 The center of a tube cap is commonly a dark hole, so the annulus is fixed at
+	 half the detected radius instead of sampling the center or arbitrary points.
+	 The optional mask excludes the plate and contour edges before averaging.
+	 """
 		height, width = roi_image.shape[:2]
-		if height < 3 or width < 3:
+		if roi_image.ndim != 3 or roi_image.shape[2] != 3 or min(height, width) < 3:
 			return None
-
-		hsv = cv2.cvtColor(roi_image, cv2.COLOR_BGR2HSV)
-		value_plane = hsv[:, :, 2]
-		cap_mask = samples_mask.astype(bool) if samples_mask is not None else np.ones(
-			(height, width), dtype=bool
-		)
-		background = ~cap_mask
-		background_median = int(np.median(value_plane[background])) if int(background.sum()) else 0
+		if radius <= 0:
+			return None
 
 		cx, cy = center
-		ring_radius = min(max(1, int(round(radius * 0.5))), max(1, min(height, width) // 2))
-
-		samples: list[tuple[int, int, int]] = []
-		for index in range(num_samples):
-			angle = 2.0 * np.pi * index / num_samples
-			sx = int(round(cx + ring_radius * np.cos(angle)))
-			sy = int(round(cy + ring_radius * np.sin(angle)))
-			if not (0 <= sx < width and 0 <= sy < height):
-				continue
-			if not cap_mask[sy, sx]:
-				continue
-			y0, y1 = max(0, sy - 1), min(height, sy + 2)
-			x0, x1 = max(0, sx + 1), min(width, sx + 2)
-			sample = tuple(int(v) for v in hsv[y0:y1, x0:x1].mean(axis=(0, 1)))
-			if sample[2] < MIN_SAMPLE_VALUE:
-				continue
-			samples.append(sample)
-
-		if len(samples) < MIN_COLOR_SAMPLES:
+		if not (0 <= cx < width and 0 <= cy < height):
+			return None
+		ring_radius = max(1, int(round(radius * 0.5)))
+		ring_thickness = max(1, int(round(radius * 0.15)))
+		outer = np.zeros((height, width), dtype=np.uint8)
+		inner = np.zeros_like(outer)
+		cv2.circle(outer, (cx, cy), ring_radius + ring_thickness, 255, -1)
+		cv2.circle(inner, (cx, cy), max(0, ring_radius - ring_thickness), 255, -1)
+		ring = cv2.subtract(outer, inner).astype(bool)
+		if samples_mask is not None:
+			if samples_mask.shape[:2] != (height, width):
+				return None
+			ring &= samples_mask.astype(bool)
+		if int(ring.sum()) < MIN_COLOR_SAMPLES:
 			return None
 
-		best_name: Optional[str] = None
-		best_key = None
+		average_bgr = roi_image[ring].mean(axis=0).astype(np.uint8)
+		ring_hsv = cv2.cvtColor(roi_image, cv2.COLOR_BGR2HSV)[ring]
+		self.last_color_stats = {
+			"sample_count": int(len(ring_hsv)),
+			"hue_min": float(np.min(ring_hsv[:, 0]) * 2.0),
+			"hue_max": float(np.max(ring_hsv[:, 0]) * 2.0),
+			"saturation_min": float(np.min(ring_hsv[:, 1]) / 255.0 * 100.0),
+			"saturation_max": float(np.max(ring_hsv[:, 1]) / 255.0 * 100.0),
+			"value_min": float(np.min(ring_hsv[:, 2]) / 255.0 * 100.0),
+			"value_max": float(np.max(ring_hsv[:, 2]) / 255.0 * 100.0),
+		}
+		average_hsv = cv2.cvtColor(average_bgr.reshape(1, 1, 3), cv2.COLOR_BGR2HSV)[0, 0]
+		hue, saturation, value = (int(component) for component in average_hsv)
+
+		background_value = 0
+		if samples_mask is not None:
+			background = ~samples_mask.astype(bool)
+			if int(background.sum()):
+				background_hsv = cv2.cvtColor(roi_image, cv2.COLOR_BGR2HSV)
+				background_value = int(background_hsv[:, :, 2][background].mean())
+
+		sample = (hue, saturation, value)
+		matching_ranges: list[tuple[int, str]] = []
 		for color_range in self.color_ranges:
-			value_floor = color_range.lower[2]
-			if color_range.relative_value and background_median:
-				value_floor = min(value_floor, int(background_median * NEUTRAL_RELATIVE_VALUE_GAIN))
-			count = 0
-			hue_distance = 0
-			for hue, saturation, value in samples:
-				if self._color_range_matches(color_range, hue, saturation, value, value_floor):
-					count += 1
-				hue_distance += self._hue_distance(color_range, hue)
-			if count == 0:
-				continue
-			key = (
-				count,
-				color_range.priority,
-				-int(hue_distance / len(samples)),
-				value_floor,
-				color_range.name,
-			)
-			if best_key is None or key > best_key:
-				best_key = key
-				best_name = color_range.name
+			lower = self._scale_hsv(color_range.lower)
+			upper = self._scale_hsv(color_range.upper)
+			value_floor = lower[2]
+			if color_range.relative_value and background_value:
+				value_floor = min(value_floor, int(background_value * 1.35))
+			if self._color_range_matches(color_range, *sample, value_floor=value_floor):
+				matching_ranges.append((color_range.priority, color_range.name))
 
-		if best_name is None or best_key[0] / len(samples) < min_agreement:
+		if not matching_ranges:
 			return None
-		return best_name
+		return max(matching_ranges)[1]
+
+	@staticmethod
+	def _scale_hsv(
+		hsv_percentage: Tuple[float, float, float],
+	) -> tuple[int, int, int]:
+		"""Scale degree/percentage HSV values to OpenCV's (180, 255, 255) ranges."""
+		hue, saturation, value = hsv_percentage
+		if not 0 <= hue <= 360 or not 0 <= saturation <= 100 or not 0 <= value <= 100:
+			raise ValueError("HSV hue must be 0-360; saturation and value must be 0-100")
+		return (
+			round(hue * 180 / 360),
+			round(saturation * 255 / 100),
+			round(value * 255 / 100),
+		)
 
 	@staticmethod
 	def _color_range_matches(
@@ -300,8 +300,8 @@ class TubeLocator:
 		value_floor: int,
 	) -> bool:
 		"""Return whether one HSV sample falls inside a range, honouring hue wrap."""
-		lower_hue, lower_saturation, lower_value = color_range.lower
-		upper_hue, upper_saturation, upper_value = color_range.upper
+		lower_hue, lower_saturation, _ = TubeLocator._scale_hsv(color_range.lower)
+		upper_hue, upper_saturation, upper_value = TubeLocator._scale_hsv(color_range.upper)
 		if lower_hue <= upper_hue:
 			hue_ok = lower_hue <= hue <= upper_hue
 		else:
@@ -315,8 +315,8 @@ class TubeLocator:
 	@staticmethod
 	def _hue_distance(color_range: ColorRange, hue: int) -> int:
 		"""Distance from a hue to the nearest edge of the range's hue segment."""
-		lower_hue, _, _ = color_range.lower
-		upper_hue, _, _ = color_range.upper
+		lower_hue, _, _ = TubeLocator._scale_hsv(color_range.lower)
+		upper_hue, _, _ = TubeLocator._scale_hsv(color_range.upper)
 		if lower_hue <= upper_hue:
 			if lower_hue <= hue <= upper_hue:
 				return 0
@@ -340,6 +340,8 @@ class TubeLocator:
 		roi: ROI,
 	) -> Tuple[Optional[Point], bool, Optional[str], Optional[np.ndarray]]:
 		"""Return the detection result, cap color, and raw HSV threshold mask for the ROI."""
+		self.last_color_stats = None
+		self.last_color_radius = None
 		if frame is None or frame.size == 0:
 			return None, False, None, None
 
@@ -408,6 +410,7 @@ class TubeLocator:
 						int(round(float(roi_center[0, 0, 1]))),
 					)
 					enclosing_center, enclosing_radius = cv2.minEnclosingCircle(contour)
+					self.last_color_radius = int(round(enclosing_radius))
 					color = self._classify_color(
 						roi_image,
 						(
@@ -435,6 +438,8 @@ class TubeLocator:
 		roi: ROI,
 	) -> Tuple[Optional[Point], bool, Optional[str], Optional[np.ndarray], list[Circle], Optional[np.ndarray]]:
 		"""Detect circles and return a montage of the intermediate OpenCV Mats."""
+		self.last_color_stats = None
+		self.last_color_radius = None
 		if frame is None or frame.size == 0:
 			return None, False, None, None, [], None
 
@@ -489,6 +494,18 @@ class TubeLocator:
 					int(round(float(frame_circle[1]))),
 					int(radius),
 				))
+		if not circles:
+			fallback = self._circle_from_mask(mask, min_radius, max_radius)
+			if fallback is not None:
+				x, y, radius = fallback
+				roi_circles.append(fallback)
+				roi_circle = np.array([[[float(x), float(y)]]], dtype=np.float32)
+				frame_circle = cv2.perspectiveTransform(roi_circle, np.linalg.inv(warp))[0, 0]
+				circles.append((
+					int(round(float(frame_circle[0]))),
+					int(round(float(frame_circle[1]))),
+					radius,
+				))
 
 		center: Optional[Point] = None
 		color: Optional[str] = None
@@ -499,9 +516,29 @@ class TubeLocator:
 			)
 			center = (circles[best_index][0], circles[best_index][1])
 			roi_circle = roi_circles[best_index]
-			# color = self._classify_color(roi_image, (roi_circle[0], roi_circle[1]), radius=roi_circle[2])
+			self.last_color_radius = roi_circle[2]
+			color = self._classify_color(roi_image, (roi_circle[0], roi_circle[1]), radius=roi_circle[2])
 		debug_montage = self._circle_debug_montage(roi_image, gray, hough_input, roi_circles)
 		return center, bool(circles), color, raw_mask, circles, debug_montage
+
+	@staticmethod
+	def _circle_from_mask(
+		mask: np.ndarray,
+		min_radius: int,
+		max_radius: int,
+	) -> Optional[Circle]:
+		"""Recover a cap circle from its segmented contour when Hough rejects it."""
+		contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+		if not contours:
+			return None
+		contour = max(contours, key=cv2.contourArea)
+		if cv2.contourArea(contour) < np.pi * min_radius**2 * 0.25:
+			return None
+		(center_x, center_y), radius = cv2.minEnclosingCircle(contour)
+		radius = int(round(radius))
+		if not min_radius <= radius <= max_radius:
+			return None
+		return int(round(center_x)), int(round(center_y)), radius
 
 	@staticmethod
 	def _suppress_inner_circles(circles: list[Circle]) -> list[Circle]:
@@ -569,8 +606,9 @@ class TubeLocator:
 		tube_present: bool,
 		circles: Optional[list[Circle]] = None,
 		color: Optional[str] = None,
+		color_radius: Optional[int] = None,
 	) -> np.ndarray:
-		"""Draw the rotated ROI, its target center, and any detected center."""
+		"""Draw the rotated ROI, detected center, and color-sampling ring."""
 		center_x, center_y, _, _ = roi
 		preview = frame.copy()
 		cv2.polylines(
@@ -587,6 +625,24 @@ class TubeLocator:
 
 		if center is not None:
 			cv2.drawMarker(preview, center, (0, 0, 255), cv2.MARKER_CROSS, 20, 2)
+			if color_radius is None and circles:
+				color_radius = min(
+					circles,
+					key=lambda circle: (circle[0] - center[0]) ** 2 + (circle[1] - center[1]) ** 2,
+				)[2]
+			if color_radius is not None and color_radius > 0:
+				ring_radius = max(1, int(round(color_radius * 0.5)))
+				for start_angle in range(0, 360, 20):
+					cv2.ellipse(
+						preview,
+						center,
+						(ring_radius, ring_radius),
+						0,
+						start_angle,
+						start_angle + 10,
+						(0, 255, 255),
+						1,
+					)
 		status = "Tube present" if tube_present else "No tube present"
 		if center is not None:
 			real_x, real_y = pixel_to_real(center[0], center[1])

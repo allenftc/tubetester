@@ -86,6 +86,11 @@
           <input id="circle-canny-threshold" type="range" min="50" max="250" step="1" value="130" style="width:100%">
         </label>
       </div>
+      <div style="display:flex;align-items:center;gap:10px;margin-top:14px;flex-wrap:wrap">
+        <button id="color-range-record-button" type="button" class="secondary">Record color range</button>
+        <button id="color-range-reset-button" type="button" class="secondary">Reset</button>
+        <span id="color-range-values" class="muted">HSV range recorder is idle.</span>
+      </div>
       <div class="camera-feed-grid" style="display:grid;grid-template-columns:repeat(auto-fit,minmax(min(100%,320px),1fr));gap:14px;margin-top:16px">
         <figure style="margin:0;min-width:0">
           <figcaption id="camera-feed-caption" class="muted" style="margin-bottom:6px">Camera + HSV locator overlay</figcaption>

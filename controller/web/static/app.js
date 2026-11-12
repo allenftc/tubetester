@@ -15,6 +15,7 @@ const state = {
   cameraImageFailed: false,
   cameraPollTimer: null,
   cameraLocateBusy: false,
+  colorRangeRecording: false,
   stereoTestBusy: false,
   cameraPickupSession: null,
   cameraPickupPreviewWasEnabled: true,
@@ -69,6 +70,8 @@ function connectCameraPreview() {
     });
   }
   el("circle-method").addEventListener("change", () => setCameraCircleParameters());
+  el("color-range-record-button").addEventListener("click", () => setColorRangeRecording(!state.colorRangeRecording));
+  el("color-range-reset-button").addEventListener("click", () => resetColorRangeRecording());
   window.addEventListener("pagehide", () => {
     if (state.cameraEnabled) {
       fetch("/api/camera/preview", {
@@ -77,6 +80,28 @@ function connectCameraPreview() {
         body: JSON.stringify({enabled: false}),
         keepalive: true,
       }).catch(() => {});
+    }
+
+    async function setColorRangeRecording(recording) {
+      const button = el("color-range-record-button");
+      button.disabled = true;
+      try {
+        const result = await api("/api/camera/color-range-recording", {recording});
+        renderCameraStatus(result);
+      } catch (error) {
+        announce(error.message);
+      } finally {
+        button.disabled = false;
+      }
+    }
+
+    async function resetColorRangeRecording() {
+      try {
+        const result = await api("/api/camera/color-range-recording", {recording: false, reset: true});
+        renderCameraStatus(result);
+      } catch (error) {
+        announce(error.message);
+      }
     }
   });
   if (["running", "failed"].includes(state.cameraPickupSession?.state)) restorePickupCameraPreview();
@@ -220,6 +245,16 @@ function renderCameraStatus(status) {
     el("circle-canny-threshold-value").textContent = status.circle_canny_threshold;
   }
   if (status.circle_method) el("circle-method").value = status.circle_method;
+  const recordButton = el("color-range-record-button");
+  state.colorRangeRecording = Boolean(status.color_range_recording);
+  recordButton.textContent = status.color_range_recording ? "Stop recording" : "Record color range";
+  const range = status.color_range;
+  setText(
+    "color-range-values",
+    range
+      ? `H ${Number(range.hue_min).toFixed(0)}–${Number(range.hue_max).toFixed(0)}° · S ${Number(range.saturation_min).toFixed(0)}–${Number(range.saturation_max).toFixed(0)}% · V ${Number(range.value_min).toFixed(0)}–${Number(range.value_max).toFixed(0)}% · ${range.sample_count} samples`
+      : status.color_range_recording ? "Recording HSV values from the color ring…" : "HSV range recorder is idle.",
+  );
   const available = Boolean(status.available);
   const starting = ["starting", "connecting"].includes(status.state);
   setChip("camera-chip", available ? "CAMERA LIVE" : starting ? "CAMERA STARTING" : "CAMERA UNAVAILABLE", available ? "ready" : starting ? "warning" : "error");

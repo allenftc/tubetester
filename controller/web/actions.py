@@ -9,6 +9,7 @@ from controller.network.moonraker import MoonrakerResponse
 from controller.vision.camera_preview import CameraPreviewService
 from controller.vision.tubeLocator.tube_locator import (
     STEREO_BASELINE_MM,
+    pixel_to_real,
     triangulate_stereo_circles,
 )
 from controller.web.events import utc_timestamp
@@ -270,13 +271,13 @@ class CameraPickupActions:
             raise ValueError("row is outside rack bounds")
         if isinstance(column, bool) or not isinstance(column, int) or not 1 <= column <= self.settings.rack.columns:
             raise ValueError("column is outside rack bounds")
-        pickup_height = self.settings.rack.pickup_height_mm
         safe_z = self.settings.rack.safe_z_mm
-        if not math.isfinite(pickup_height) or not math.isfinite(safe_z) or pickup_height >= safe_z:
-            raise RuntimeUnavailable("rack.json pickup_height_mm must be finite and below safe_z_mm.")
         scan_height = self.settings.rack.scan_height_mm
-        if not math.isfinite(scan_height) or scan_height < safe_z:
-            raise RuntimeUnavailable("rack.json scan_height_mm must be finite and at or above safe_z_mm.")
+        post_pickup_height = self.settings.rack.post_pickup_height_mm
+        if not math.isfinite(scan_height):
+            raise RuntimeUnavailable("rack.json scan_height_mm must be finite.")
+        if not math.isfinite(post_pickup_height) or post_pickup_height < scan_height:
+            raise RuntimeUnavailable("rack.json post_pickup_height_mm must be finite and at or above scan_height_mm.")
         snapshot = await self.snapshot()
         if not snapshot["capabilities"]["send_gcode"]:
             raise RuntimeUnavailable("Klipper must be ready and the workflow inactive before locating a tube.")
@@ -300,28 +301,15 @@ class CameraPickupActions:
             camera_x = tube.x - offset.x
             camera_y = tube.y - offset.y
             target = {"x": None, "y": None}
-            stereo_half_baseline = STEREO_BASELINE_MM / 2.0
             steps = [
-                {"label": f"Raise to safe Z={safe_z:.2f} mm", "command": self.motion.synchronized_move_command(z=safe_z, feedrate=10000), "state": "pending"},
-                {"label": f"Move camera to left stereo view X={camera_x - stereo_half_baseline:.2f} Y={camera_y:.2f} mm", "command": self.motion.synchronized_move_command(x=camera_x - stereo_half_baseline, y=camera_y, feedrate=10000), "state": "pending"},
-                {"label": "Capture left stereo view of the tube center", "command": "CAMERA_CAPTURE_LEFT", "state": "pending"},
-                {"label": f"Move camera to right stereo view X={camera_x + stereo_half_baseline:.2f} Y={camera_y:.2f} mm", "command": self.motion.synchronized_move_command(x=camera_x + stereo_half_baseline, y=camera_y, feedrate=10000), "state": "pending"},
-                {"label": "Capture right stereo view and estimate tube XYZ", "command": "CAMERA_CAPTURE_RIGHT", "state": "pending"},
-                {"label": "Move gripper to corrected XY at safe Z", "command": "WAITING_FOR_DETECTION", "state": "pending"},
-                {"label": "Turn vacuum on", "command": self.motion.pickup_command(), "state": "pending"},
-                {"label": f"Lower to pickup Z={pickup_height:.2f} mm", "command": self.motion.synchronized_move_command(z=pickup_height, feedrate=3000), "state": "pending"},
-                {"label": f"Lift to scan Z={scan_height:.2f} mm with vacuum maintained", "command": self.motion.synchronized_move_command(z=scan_height, feedrate=5000), "state": "pending"},
-                {
-                    "label": "Deposit tube at the center of the selected slot",
-                    "command": "\n".join((
-                        self.motion.synchronized_move_command(x=tube.x, y=tube.y, feedrate=5000),
-                        self.motion.synchronized_move_command(z=pickup_height, feedrate=3000),
-                        self.motion.release_command(),
-                        self.motion.vacuum_off_command(),
-                        self.motion.synchronized_move_command(z=scan_height, feedrate=5000),
-                    )),
-                    "state": "pending",
-                },
+                {"label": f"Move camera to scan Z={scan_height:.2f} mm", "command": self.motion.synchronized_move_command(x=camera_x, y=camera_y, z=scan_height, feedrate=10000), "state": "pending"},
+                {"label": "Find tube and record its color from the sampling ring", "command": "WAITING_FOR_DETECTION", "state": "pending"},
+                {"label": "Move to the configured color-specific pickup height", "command": "WAITING_FOR_COLOR_HEIGHT", "state": "pending"},
+                {"label": "Calculate matrix world offset and move gantry", "command": "WAITING_FOR_WORLD_OFFSET", "state": "pending"},
+                {"label": "Turn vacuum pump on", "command": self.motion.pickup_command(), "state": "pending"},
+                {"label": "Move down to the color-specific pickup height", "command": "WAITING_FOR_PICKUP_HEIGHT", "state": "pending"},
+                {"label": f"Raise to Z={post_pickup_height:.2f} mm", "command": self.motion.synchronized_move_command(z=post_pickup_height, feedrate=5000), "state": "pending"},
+                {"label": "Turn vacuum pump off", "command": self.motion.vacuum_off_command(), "state": "pending"},
             ]
             self._debug_pickup = {
                 "id": f"pickup_{uuid.uuid4().hex}",
@@ -339,7 +327,10 @@ class CameraPickupActions:
                 "detected_center_px": None,
                 "stereo_position_mm": None,
                 "correction_mm": None,
-                "pickup_height_mm": pickup_height,
+                "pickup_height_mm": None,
+                "calibrated_scan_height_mm": None,
+                "detected_color": None,
+                "world_offset_mm": None,
                 "scan_height_mm": scan_height,
                 "safe_z_mm": safe_z,
                 "current_z": None,
@@ -366,7 +357,37 @@ class CameraPickupActions:
             step = session["steps"][index]
             correlation_id = session["correlation_id"]
             try:
-                if index in {2, 4}:
+                if index == 1:
+                    step["state"] = "running"
+                    detection = await asyncio.to_thread(
+                        camera_preview.wait_for_hough_detection,
+                        session["detection_sequence"],
+                        10,
+                        8.0,
+                        True,
+                        3,
+                    )
+                    if detection is None:
+                        raise RuntimeUnavailable("No tube center detected at scan height; no pickup was made.")
+                    center = detection["detected_center"]
+                    color = detection.get("detected_color")
+                    if not color:
+                        raise RuntimeUnavailable("Tube detected but no color was classified; no pickup was made.")
+                    session["detected_center_px"] = center
+                    session["detected_color"] = color
+                    session["calibrated_scan_height_mm"] = (
+                        self.settings.rack.calibrated_scan_height_for_color(color)
+                    )
+                    session["pickup_height_mm"] = self.settings.rack.pickup_height_for_color(color)
+                    step["label"] = f"Detected {color} tube at px=({center[0]:.1f}, {center[1]:.1f})"
+                elif index == 2:
+                    pickup_height = session["calibrated_scan_height_mm"]
+                    if pickup_height is None or not math.isfinite(pickup_height):
+                        raise RuntimeUnavailable("Color-specific calibration scan height must be finite.")
+                    step["command"] = self.motion.synchronized_move_command(z=pickup_height, feedrate=3000)
+                    step["label"] = f"Move to {session['detected_color']} offset scan Z={pickup_height:.2f} mm"
+                    await self._send_macro_gcode(step["command"], correlation_id)
+                elif index == 3:
                     step["state"] = "running"
                     detection = await asyncio.to_thread(
                         camera_preview.wait_for_hough_detection,
@@ -375,47 +396,29 @@ class CameraPickupActions:
                         8.0,
                     )
                     if detection is None:
-                        view = "left" if index == 2 else "right"
-                        raise RuntimeUnavailable(f"No tube center detected in the {view} stereo view; no pickup was made.")
+                        raise RuntimeUnavailable("No tube center detected at the color-adjusted calibration height.")
                     center = detection["detected_center"]
-                    if index == 2:
-                        session["left_center_px"] = center
-                        self.events.publish(
-                            f"Captured left stereo circle center px=({center[0]:.1f}, {center[1]:.1f}).",
-                            source="camera",
-                            correlation_id=correlation_id,
-                        )
-                    else:
-                        left_center = session["left_center_px"]
-                        if left_center is None:
-                            raise RuntimeError("The left stereo view was not captured before the right view.")
-                        stereo_position = triangulate_stereo_circles(
-                            (float(left_center[0]), float(left_center[1])),
-                            (float(center[0]), float(center[1])),
-                            (int(detection["width"]), int(detection["height"])),
-                        )
-                        correction_x, stereo_y, depth = stereo_position
-                        correction_y = -stereo_y
-                        target_x = session["tube_xy"]["x"] + correction_x
-                        target_y = session["tube_xy"]["y"] + correction_y
-                        session["target_xy"] = {"x": target_x, "y": target_y}
-                        session["detected_center_px"] = center
-                        session["stereo_position_mm"] = {
-                            "x": correction_x,
-                            "y": stereo_y,
-                            "z": depth,
-                        }
-                        session["correction_mm"] = {"x": correction_x, "y": correction_y}
-                        next_step = session["steps"][5]
-                        next_step["command"] = self.motion.synchronized_move_command(x=target_x, y=target_y, feedrate=5000)
-                        next_step["label"] = f"Move gripper to stereo-corrected X={target_x:.2f} Y={target_y:.2f} mm at safe Z"
-                        self.events.publish(
-                            f"Stereo tube estimate camera XYZ=({correction_x:.2f}, {stereo_y:.2f}, {depth:.2f}) mm; "
-                            f"correction X={correction_x:.2f} Y={correction_y:.2f} mm; "
-                            f"gripper target X={target_x:.2f} Y={target_y:.2f} mm.",
-                            source="camera",
-                            correlation_id=correlation_id,
-                        )
+                    session["detected_center_px"] = center
+                    matrix_x, matrix_y = pixel_to_real(float(center[0]), float(center[1]))
+                    target_x = session["camera_xy"]["x"] + matrix_x
+                    target_y = session["camera_xy"]["y"] + matrix_y
+                    offset_x = target_x - session["tube_xy"]["x"]
+                    offset_y = target_y - session["tube_xy"]["y"]
+                    session["target_xy"] = {"x": target_x, "y": target_y}
+                    session["world_offset_mm"] = {"x": offset_x, "y": offset_y}
+                    step["command"] = self.motion.synchronized_move_command(x=target_x, y=target_y, feedrate=5000)
+                    step["label"] = (
+                        f"Move gantry to corrected X={target_x:.2f} Y={target_y:.2f} mm "
+                        f"(matrix offset {matrix_x:.2f}, {matrix_y:.2f})"
+                    )
+                    await self._send_macro_gcode(step["command"], correlation_id)
+                elif index == 5:
+                    pickup_height = session["pickup_height_mm"]
+                    if pickup_height is None or not math.isfinite(pickup_height):
+                        raise RuntimeUnavailable("Color-specific pickup height must be finite.")
+                    step["command"] = self.motion.synchronized_move_command(z=pickup_height, feedrate=3000)
+                    step["label"] = f"Move to {session['detected_color']} pickup Z={pickup_height:.2f} mm"
+                    await self._send_macro_gcode(step["command"], correlation_id)
                 else:
                     step["state"] = "running"
                     command = step["command"]
@@ -427,18 +430,18 @@ class CameraPickupActions:
                     )
                     await self._send_macro_gcode(command, correlation_id)
                     if index == 0:
-                        session["current_z"] = session["safe_z_mm"]
-                    elif index in {1, 3}:
+                        session["current_z"] = session["scan_height_mm"]
                         session["detection_sequence"] = camera_preview.status()["sequence"]
-                    elif index == 6:
+                    elif index == 2:
+                        session["current_z"] = session["calibrated_scan_height_mm"]
+                        session["detection_sequence"] = camera_preview.status()["sequence"]
+                    elif index == 4:
                         session["vacuum_enabled"] = True
-                    elif index == 7:
+                    elif index == 5:
                         session["current_z"] = session["pickup_height_mm"]
-                    elif index == 8:
-                        session["current_z"] = session["scan_height_mm"]
-                    elif index == 9:
-                        session["current_z"] = session["scan_height_mm"]
-                        session["target_xy"] = session["tube_xy"]
+                    elif index == 6:
+                        session["current_z"] = self.settings.rack.post_pickup_height_mm
+                    elif index == 7:
                         session["vacuum_enabled"] = False
 
                 step["state"] = "completed"
@@ -446,7 +449,7 @@ class CameraPickupActions:
                 if session["next_step"] == len(session["steps"]):
                     session["state"] = "completed"
                     self.events.publish(
-                        "Pickup and deposit complete; tube returned to the selected slot and vacuum is off.",
+                        f"Camera-guided tube positioning complete; tube raised to Z={self.settings.rack.post_pickup_height_mm:.2f} and vacuum turned off.",
                         source="camera",
                         correlation_id=correlation_id,
                     )
@@ -457,7 +460,7 @@ class CameraPickupActions:
             except Exception:
                 step["state"] = "failed"
                 session["state"] = "failed"
-                if index in {0, 7, 8, 9}:
+                if index in {0, 2, 5, 6}:
                     session["current_z"] = None
                 self._broadcast_status()
                 raise
@@ -503,10 +506,15 @@ class CameraPickupActions:
             "target_xy": dict(session["target_xy"]),
             "left_center_px": list(session["left_center_px"]) if session["left_center_px"] else None,
             "detected_center_px": session["detected_center_px"],
+            "detected_color": session["detected_color"],
+            "world_offset_mm": dict(session["world_offset_mm"]) if session["world_offset_mm"] else None,
             "stereo_position_mm": dict(session["stereo_position_mm"]) if session["stereo_position_mm"] else None,
             "correction_mm": dict(session["correction_mm"]) if session["correction_mm"] else None,
             "pickup_height_mm": session["pickup_height_mm"],
+            "calibrated_scan_height_mm": session["calibrated_scan_height_mm"],
             "scan_height_mm": session["scan_height_mm"],
+            "scan_height_with_offset_mm": self.settings.rack.scan_height_with_offset_mm,
+            "post_pickup_height_mm": self.settings.rack.post_pickup_height_mm,
             "safe_z_mm": session["safe_z_mm"],
             "vacuum_enabled": session["vacuum_enabled"],
         }

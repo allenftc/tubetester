@@ -43,6 +43,7 @@ def create_control_app(
     app.router.add_post("/api/camera/preview", _camera_preview_toggle)
     app.router.add_post("/api/camera/detection-mode", _camera_detection_mode)
     app.router.add_post("/api/camera/circle-parameters", _camera_circle_parameters)
+    app.router.add_post("/api/camera/color-range-recording", _camera_color_range_recording)
     app.router.add_post("/api/actions/home", _home)
     app.router.add_post("/api/actions/preview", _preview)
     app.router.add_post("/api/actions/locate-tube", _locate_tube)
@@ -183,6 +184,18 @@ async def _camera_circle_parameters(request: web.Request) -> web.Response:
         "circle_canny_threshold": float(canny_threshold),
         "circle_method": method,
     })
+
+
+async def _camera_color_range_recording(request: web.Request) -> web.Response:
+    body = await _json_body(request)
+    recording = body.get("recording")
+    if not isinstance(recording, bool):
+        raise ValueError("recording must be a boolean")
+    preview: CameraPreviewService = request.app["camera_preview"]
+    if body.get("reset") is True:
+        preview.reset_color_range_recording()
+    preview.set_color_range_recording(recording)
+    return web.json_response({"ok": True, **preview.status()})
 
 
 async def _camera_stream(request: web.Request) -> web.StreamResponse:
