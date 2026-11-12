@@ -17,6 +17,6 @@
     "light teal": 49.9
   },
   "scan_height_mm": 40,
-  "scan_height_with_offset": 25,
+  "scan_height_with_offset": 20,
   "post_pickup_height_mm": 150
 }

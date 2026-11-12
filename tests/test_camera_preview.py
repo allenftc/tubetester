@@ -88,6 +88,46 @@ class CameraPreviewTests(unittest.TestCase):
         self.assertTrue(circles)
         self.assertEqual(debug.shape, (320, 320, 3))
 
+    def test_hough_selection_prefers_circle_near_roi_center(self) -> None:
+        frame = np.zeros((60, 60, 3), dtype=np.uint8)
+        locator = TubeLocator(show_preview=False, roi_rotation_deg=0)
+        # The off-center circle is larger and therefore listed first; with equal
+        # (zero) edge support the candidate nearest the ROI center must win.
+        detected = np.array(
+            [[[5.0, 5.0, 8.0], [20.0, 20.0, 4.0]]],
+            dtype=np.float32,
+        )
+
+        with patch("controller.vision.tubeLocator.tube_locator.cv2.HoughCircles", return_value=detected):
+            center, tube_present, _, _, circles, _ = locator.locate_with_circles(frame, (20, 20, 40, 40))
+
+        self.assertTrue(tube_present)
+        self.assertIsNotNone(center)
+        self.assertEqual(len(circles), 2)
+        self.assertEqual(center, circles[1][:2])
+
+    def test_hough_selection_still_accepts_a_stronger_edge_off_center(self) -> None:
+        frame = np.zeros((60, 60, 3), dtype=np.uint8)
+        locator = TubeLocator(show_preview=False, roi_rotation_deg=0)
+        detected = np.array(
+            [[[5.0, 5.0, 8.0], [20.0, 20.0, 4.0]]],
+            dtype=np.float32,
+        )
+
+        def fake_score(_image: np.ndarray, circle: tuple[int, int, int]) -> float:
+            return 0.95 if circle[2] == 8 else 0.0
+
+        with (
+            patch("controller.vision.tubeLocator.tube_locator.cv2.HoughCircles", return_value=detected),
+            patch.object(TubeLocator, "_circle_score", fake_score),
+        ):
+            center, tube_present, _, _, circles, _ = locator.locate_with_circles(frame, (20, 20, 40, 40))
+
+        self.assertTrue(tube_present)
+        self.assertIsNotNone(center)
+        self.assertEqual(len(circles), 2)
+        self.assertEqual(center, circles[0][:2])
+
     def test_hough_detector_falls_back_to_segmented_circle(self) -> None:
         frame = np.zeros((100, 100, 3), dtype=np.uint8)
         cv2.circle(frame, (50, 50), 20, (255, 255, 255), -1)

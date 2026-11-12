@@ -1,10 +1,10 @@
 .rack-grid {
-  grid-auto-rows: 64px;
-  min-width: max-content;
+  grid-auto-rows: auto;
+  min-width: 0;
 }
 
 .rack-label.column {
-  height: 64px;
+  height: auto;
 }
 
 .rack-cell {

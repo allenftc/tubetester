@@ -156,8 +156,9 @@ class WebTests(unittest.IsolatedAsyncioTestCase):
         index = await self.client.get("/")
         html = await index.text()
         self.assertEqual(index.status, 200)
-        for landmark in ("Home Machine", "Preview Run", "Start Scan", "Rack 6 × 12", "Begin Pickup Steps", "Run Next Step", "Cancel Steps", "Console", "Send code"):
+        for landmark in ("Home Machine", "Preview Run", "Start Scan", "Rack 6 × 12", "Begin Pickup Steps", "Run Next Step", "Cancel Steps"):
             self.assertIn(landmark, html)
+        self.assertNotIn('id="console-card"', html)
         self.assertIn('id="camera-preview-toggle" type="checkbox"', html)
         self.assertIn('id="camera-stream" alt=', html)
         self.assertIn('id="camera-mask-stream" alt=', html)

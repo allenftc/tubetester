@@ -1,11 +1,8 @@
 "use strict";
 
-const LEVELS = ["debug", "info", "warning", "error"];
-const SOURCES = ["controller", "workflow", "moonraker", "klipper", "camera", "qr", "user"];
 const ACTIVE_TUBES = new Set(["approaching", "picked_up", "scanning"]);
 const state = {
   snapshot: null,
-  events: new Map(),
   selectedTube: null,
   lastSequence: 0,
   reconnectDelay: 500,
@@ -19,15 +16,9 @@ const state = {
   stereoTestBusy: false,
   cameraPickupSession: null,
   cameraPickupPreviewWasEnabled: true,
-  clearWatermark: sessionStorage.getItem("console-clear-watermark"),
-  filters: loadJSON("console-filters", {levels: LEVELS.filter(level => level !== "debug"), sources: SOURCES}),
 };
 const el = id => document.getElementById(id);
 
-function loadJSON(key, fallback) {
-  try { return {...fallback, ...JSON.parse(localStorage.getItem(key) || "null")}; }
-  catch (_) { return fallback; }
-}
 function setText(id, text) { el(id).textContent = String(text); }
 function classToken(value) { return String(value || "neutral").toLowerCase().replace(/[^a-z0-9_-]/g, "-"); }
 
@@ -40,8 +31,6 @@ async function api(path, body = {}) {
 
 async function bootstrap() {
   wireControls();
-  buildFilters();
-  applyCollapsedPreference();
   try {
     const response = await fetch("/api/status", {cache: "no-store"});
     renderSnapshot(await response.json());
@@ -289,7 +278,7 @@ function connectSocket() {
     }
     state.lastSequence = Math.max(state.lastSequence, message.sequence || 0);
     if (message.type === "status.snapshot") renderSnapshot(message.payload);
-    if (message.type === "console.event") upsertEvent(message.payload);
+    if (message.type === "console.event") handleConsoleEvent(message.payload);
     if (message.type === "ping") socket.send(JSON.stringify({type: "pong", sequence: message.sequence}));
   });
   socket.addEventListener("close", () => {
@@ -348,8 +337,6 @@ function setCapabilities(caps, workflowState) {
   pause.title = resume ? "Continue the paused scan." : "Pause after the active Moonraker command finishes.";
   setText("pause-description", resume ? "Continue scan" : "Hold safely");
   pause.disabled = resume ? !caps.resume : !caps.pause;
-  el("gcode-input").disabled = !caps.send_gcode;
-  el("send-button").disabled = !caps.send_gcode || !el("gcode-input").value.trim();
   ["tooling-release-button", "tooling-vacuum-button", "tooling-vacuum-off-button", "tooling-zero-button", "rotary-degrees-input"].forEach(id => { el(id).disabled = !caps.tooling; });
   el("rotary-move-button").disabled = !caps.tooling || !isWholeNumber(el("rotary-degrees-input").value);
   const pickupRunning = state.cameraPickupSession?.state === "running";
@@ -378,7 +365,7 @@ function renderStepper(currentPhase, workflowState) {
 function renderRack(rack) {
   setText("rack-title", `Rack ${rack.rows} × ${rack.columns}`);
   const grid = el("rack-grid");
-  grid.style.gridTemplateColumns = `42px repeat(${rack.columns}, 64px)`;
+  grid.style.gridTemplateColumns = `30px repeat(${rack.columns}, minmax(0, 44px))`;
   grid.replaceChildren();
   const corner = document.createElement("span"); corner.className = "rack-corner"; corner.setAttribute("aria-hidden", "true"); grid.append(corner);
   for (let column = 1; column <= rack.columns; column++) grid.append(label(`C${column}`, "column"));
@@ -477,52 +464,16 @@ function rackKeydown(event) {
   target?.focus();
 }
 
-function upsertEvent(event) {
-  state.events.set(event.id, event);
-  if (event.source === "camera" && event.message.startsWith("Tube debug step ")) {
+function handleConsoleEvent(event) {
+  if (event.source !== "camera") return;
+  if (event.message.startsWith("Tube debug step ")) {
     const item = document.createElement("li");
     item.textContent = event.message;
     el("locate-tube-steps").append(item);
   }
-  if (event.source === "camera" && event.message.startsWith("Tube debug detected center ")) {
+  if (event.message.startsWith("Tube debug detected center ")) {
     setText("locate-tube-status", event.message);
   }
-  if (state.events.size > 500) {
-    const oldest = [...state.events.values()].sort((a,b) => Date.parse(a.timestamp)-Date.parse(b.timestamp))[0];
-    state.events.delete(oldest.id);
-  }
-  renderConsole();
-}
-function renderConsole() {
-  const log = el("console-log");
-  const events = [...state.events.values()]
-    .filter(event => state.filters.levels.includes(event.level) && state.filters.sources.includes(event.source))
-    .filter(event => !state.clearWatermark || Date.parse(event.timestamp) > Date.parse(state.clearWatermark))
-    .sort((a,b) => Date.parse(b.timestamp)-Date.parse(a.timestamp)).slice(0,300);
-  log.replaceChildren();
-  if (!events.length) { const empty = document.createElement("div"); empty.className = "console-empty"; empty.textContent = "No console messages yet."; log.append(empty); return; }
-  events.forEach(event => {
-    const row = document.createElement("div"); row.className = `event-row ${classToken(event.level)}`;
-    const date = new Date(event.timestamp);
-    row.title = `${date.toLocaleString()} · ${event.source}`;
-    row.setAttribute("aria-label", `${date.toLocaleString()}, ${event.level}, ${event.source}, ${event.message}, repeated ${event.repeat_count} times`);
-    const time = document.createElement("time"); time.className = "event-time"; time.dateTime = event.timestamp; time.textContent = date.toLocaleTimeString([], {hour:"numeric",minute:"2-digit",hour12:true});
-    const level = document.createElement("span"); level.className = "event-level"; level.textContent = event.level.toUpperCase();
-    const message = document.createElement("span"); message.className = "event-message"; message.textContent = event.message;
-    const repeat = document.createElement("span"); repeat.className = "event-repeat"; repeat.textContent = event.repeat_count > 1 ? `${event.repeat_count}×` : "";
-    row.append(time, level, message, repeat); log.append(row);
-  });
-}
-
-function buildFilters() {
-  [["level-filters", LEVELS, "levels"], ["source-filters", SOURCES, "sources"]].forEach(([id, values, key]) => {
-    values.forEach(value => {
-      const label = document.createElement("label"); const input = document.createElement("input");
-      input.type = "checkbox"; input.checked = state.filters[key].includes(value); input.value = value;
-      input.addEventListener("change", () => { state.filters[key] = [...el(id).querySelectorAll("input:checked")].map(node => node.value); localStorage.setItem("console-filters", JSON.stringify(state.filters)); renderConsole(); });
-      label.append(input, document.createTextNode(` ${title(value)}`)); el(id).append(label);
-    });
-  });
 }
 
 function wireControls() {
@@ -548,18 +499,9 @@ function wireControls() {
   el("tooling-zero-button").addEventListener("click", () => act("/api/tooling/rotary/zero"));
   el("rotary-move-button").addEventListener("click", sendRotaryMove);
   el("rotary-degrees-input").addEventListener("input", event => { el("rotary-move-button").disabled = event.target.disabled || !isWholeNumber(event.target.value); });
-  el("gcode-input").addEventListener("input", event => { el("send-button").disabled = event.target.disabled || !event.target.value.trim(); });
-  el("gcode-form").addEventListener("submit", sendGcode);
-  el("clear-console").addEventListener("click", () => { state.clearWatermark = new Date().toISOString(); sessionStorage.setItem("console-clear-watermark", state.clearWatermark); renderConsole(); });
-  el("show-history").addEventListener("click", () => { state.clearWatermark = null; sessionStorage.removeItem("console-clear-watermark"); renderConsole(); });
-  toggleButton("help-console", "help-panel"); toggleButton("settings-console", "settings-panel");
-  el("collapse-console").addEventListener("click", () => { const collapsed = el("console-card").classList.toggle("collapsed"); localStorage.setItem("console-collapsed", String(collapsed)); el("collapse-console").setAttribute("aria-expanded", String(!collapsed)); });
 }
-function toggleButton(buttonId, panelId) { el(buttonId).addEventListener("click", () => { const hidden = !el(panelId).hidden; el(panelId).hidden = hidden; el(buttonId).setAttribute("aria-expanded", String(!hidden)); }); }
-function applyCollapsedPreference() { if (localStorage.getItem("console-collapsed") === "true") { el("console-card").classList.add("collapsed"); el("collapse-console").setAttribute("aria-expanded", "false"); } }
 async function act(path, body = {}) { try { const result = await api(path, body); announce(result.message); } catch (error) { announce(error.message); alert(error.message); } }
 async function preview() { try { const result = await api("/api/actions/preview"); const panel = el("preview-result"); panel.hidden = false; panel.textContent = `${result.plan.tube_count} tubes · ${result.plan.step_count} motion steps · ${result.plan.yaw_angles_deg.length} yaw angles. ${result.validation.valid ? "Validation passed." : result.validation.issues.map(issue => issue.message).join(" ")}`; } catch (error) { alert(error.message); } }
-async function sendGcode(event) { event.preventDefault(); const input = el("gcode-input"); const script = input.value.trim(); if (!script) return; try { await api("/api/gcode", {script}); input.value = ""; el("send-button").disabled = true; } catch (error) { alert(error.message); } }
 function isWholeNumber(value) { return /^-?\d+$/.test(String(value).trim()); }
 async function sendRotaryMove() {
   const input = el("rotary-degrees-input");

@@ -18,6 +18,11 @@ Circle = Tuple[int, int, int]
 STEREO_BASELINE_MM = 10.0
 HOUGH_GRADIENT = "gradient"
 HOUGH_GRADIENT_ALT = "gradient_alt"
+# Weight of the ROI-center proximity bonus relative to circumference support.
+# Support is scored in [0, 1], so 0.5 lets a centrally located circle beat a
+# stronger edge elsewhere while still preferring a well-supported ring when two
+# candidates are similarly close to the center.
+CIRCLE_PROXIMITY_BONUS = 0.5
 
 
 @dataclass(frozen=True)
@@ -512,7 +517,12 @@ class TubeLocator:
 		if circles:
 			best_index = max(
 				range(len(circles)),
-				key=lambda i: self._circle_score(blurred, roi_circles[i]),
+				key=lambda i: self._circle_priority(
+					blurred,
+					roi_circles[i],
+					roi_width,
+					roi_height,
+				),
 			)
 			center = (circles[best_index][0], circles[best_index][1])
 			roi_circle = roi_circles[best_index]
@@ -554,6 +564,24 @@ class TubeLocator:
 			if not is_inner_detection:
 				kept.append(candidate)
 		return kept
+
+	@classmethod
+	def _circle_priority(
+		cls,
+		image: np.ndarray,
+		circle: Circle,
+		roi_width: int,
+		roi_height: int,
+	) -> float:
+		"""Rank a candidate by edge support plus a bonus for ROI-center proximity."""
+		support = cls._circle_score(image, circle)
+		cx, cy, _ = circle
+		half_width = (roi_width - 1) / 2.0
+		half_height = (roi_height - 1) / 2.0
+		max_distance = max(1.0, float(np.hypot(half_width, half_height)))
+		distance = float(np.hypot(cx - half_width, cy - half_height))
+		proximity = 1.0 - min(distance / max_distance, 1.0)
+		return support + CIRCLE_PROXIMITY_BONUS * proximity
 
 	@staticmethod
 	def _circle_score(image: np.ndarray, circle: Circle) -> float:
