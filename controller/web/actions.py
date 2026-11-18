@@ -375,6 +375,7 @@ class CameraPickupActions:
                         raise RuntimeUnavailable("Tube detected but no color was classified; no pickup was made.")
                     session["detected_center_px"] = center
                     session["detected_color"] = color
+                    await self._record_tube_color(session["row"], session["column"], color)
                     session["calibrated_scan_height_mm"] = (
                         self.settings.rack.calibrated_scan_height_for_color(color)
                     )

@@ -1,13 +1,15 @@
+/* Rack scene sizing. The cabinet projection is drawn as inline SVG in app.js. */
+
 .rack-grid {
-  grid-auto-rows: auto;
   min-width: 0;
 }
 
-.rack-label.column {
-  height: auto;
+.rack-svg {
+  min-width: 460px;
 }
 
-.rack-cell {
-  min-height: 0;
-  aspect-ratio: 1;
+@media (max-width: 640px) {
+  .rack-svg {
+    min-width: 380px;
+  }
 }

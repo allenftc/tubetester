@@ -311,7 +311,7 @@ class CameraPreviewService:
         locator = TubeLocator(show_preview=False, roi_rotation_deg=self.settings.roi_rotation_deg)
         center_history: deque[tuple[int, int]] = deque(maxlen=9)
         radius_history: deque[int] = deque(maxlen=9)
-        previous_detection_mode = "hsv"
+        previous_detection_mode = "hough"
         try:
             while not self._stop_event.is_set():
                 capture = self._open_capture()

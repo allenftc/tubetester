@@ -2,7 +2,7 @@
   "origin_mm": {"x": 138.6, "y": 51.6, "z": 0.0},
   "tube_pitch_mm": {"x": 20.2, "y": 20.2},
   "pickup_offset_mm": {"x": 0.0, "y": 0.0, "z": 4.0},
-  "safe_z_mm": 42.0,
+  "safe_z_mm": 50.0,
   "columns": 6, 
   "rows": 12,
   "camera_offset_mm": {"x": 23.3, "y": -20.8, "z": 0.0},
@@ -16,7 +16,7 @@
     "green": 17.8,
     "light teal": 49.9
   },
-  "scan_height_mm": 40,
-  "scan_height_with_offset": 20,
+  "scan_height_mm": 45,
+  "scan_height_with_offset": 30,
   "post_pickup_height_mm": 150
 }

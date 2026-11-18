@@ -3,20 +3,36 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <meta name="color-scheme" content="dark light">
+  <meta name="color-scheme" content="light dark">
+  <meta name="theme-color" content="#f3f3f3" media="(prefers-color-scheme: light)">
+  <meta name="theme-color" content="#202020" media="(prefers-color-scheme: dark)">
   <title>Tube Tester Control</title>
-  <link rel="stylesheet" href="/static/app.css?v=6">
-  <link rel="stylesheet" href="/static/rack.css?v=6">
-  <script src="/static/app.js?v=6" defer></script>
+  <link rel="stylesheet" href="/static/app.css?v=15">
+  <link rel="stylesheet" href="/static/rack.css?v=15">
+  <script src="/static/app.js?v=15" defer></script>
 </head>
 <body>
   <div id="stale-banner" class="stale-banner" role="status" hidden>Live connection interrupted. Reconnecting…</div>
   <main class="shell">
     <header class="topbar card" aria-labelledby="page-title">
       <div class="identity-row">
-        <div>
-          <p class="eyebrow">AUTOMATED RACK SCANNER</p>
-          <h1 id="page-title">Tube Tester Control</h1>
+        <div class="brand">
+          <span class="brand-mark" aria-hidden="true">
+            <svg width="26" height="26" viewBox="0 0 26 26" fill="none" xmlns="http://www.w3.org/2000/svg">
+              <rect x="1" y="1" width="6" height="6" rx="1.6" fill="currentColor" opacity=".55"/>
+              <rect x="10" y="1" width="6" height="6" rx="1.6" fill="currentColor" opacity=".28"/>
+              <rect x="19" y="1" width="6" height="6" rx="1.6" fill="currentColor" opacity=".28"/>
+              <rect x="1" y="10" width="6" height="6" rx="1.6" fill="currentColor" opacity=".28"/>
+              <rect x="10" y="10" width="6" height="6" rx="1.6" fill="currentColor"/>
+              <rect x="19" y="10" width="6" height="6" rx="1.6" fill="currentColor" opacity=".28"/>
+              <rect x="1" y="19" width="6" height="6" rx="1.6" fill="currentColor" opacity=".28"/>
+              <rect x="10" y="19" width="6" height="6" rx="1.6" fill="currentColor" opacity=".55"/>
+              <rect x="19" y="19" width="6" height="6" rx="1.6" fill="currentColor" opacity=".28"/>
+            </svg>
+          </span>
+          <div>
+            <h1 id="page-title">Tube Tester Control</h1>
+          </div>
         </div>
         <div class="status-strip" aria-label="System status">
           <span id="klipper-chip" class="chip neutral">● Klipper Offline</span>
@@ -30,24 +46,15 @@
     <div class="layout">
       <section class="camera-card card" aria-labelledby="camera-title">
         <div class="section-heading">
-          <div><p class="eyebrow">LIVE V4L2 CAMERA</p><h2 id="camera-title">Tube locator preview</h2></div>
+          <div><h2 id="camera-title">Tube locator preview</h2></div>
           <span id="camera-chip" class="chip neutral">PREVIEW OFF</span>
         </div>
 
         <div class="camera-settings">
           <label for="camera-preview-toggle"><input id="camera-preview-toggle" type="checkbox"> Live preview</label>
-          <label for="camera-detection-mode">Detection
-            <select id="camera-detection-mode">
-              <option value="hsv">HSV threshold mask</option>
-              <option value="hough">Hough circles</option>
-            </select>
-          </label>
-          <button id="color-range-record-button" type="button" class="secondary compact">Record color range</button>
-          <button id="color-range-reset-button" type="button" class="secondary compact">Reset</button>
         </div>
-        <p id="color-range-values" class="muted">HSV range recorder is idle.</p>
 
-        <details id="hough-tuning" class="config-details" hidden>
+        <details id="hough-tuning" class="config-details">
           <summary>Hough tuning</summary>
           <div class="field-grid">
             <label for="circle-method">
@@ -74,14 +81,10 @@
 
         <div class="camera-feed">
           <figure class="feed-main">
-            <figcaption id="camera-feed-caption" class="muted">Camera + HSV locator overlay</figcaption>
+            <figcaption id="camera-feed-caption" class="muted">Camera + Hough circle detections (green)</figcaption>
             <img id="camera-stream" alt="Live camera frame with locator ROI and center overlay" hidden>
           </figure>
           <div class="feed-secondary">
-            <figure>
-              <figcaption class="muted">Raw HSV threshold (white = match)</figcaption>
-              <img id="camera-mask-stream" alt="Live raw HSV threshold mask; white pixels match the configured HSV range" hidden>
-            </figure>
             <figure id="camera-debug-panel" hidden>
               <figcaption class="muted">Hough Mats: ROI, gray, blur, detections</figcaption>
               <img id="camera-debug-stream" alt="Hough debugging Mats: rotated region of interest, grayscale image, blurred Hough input, and circle detections" hidden>
@@ -149,11 +152,11 @@
           <div class="rack-heading">
             <h3 id="rack-title">Rack 6 × 12</h3>
             <div class="legend" aria-label="Tube status legend">
-              <span>○ Pending</span><span>◉ Active</span><span>✓ Decoded</span><span>— No decode</span><span>! Failed</span>
+              <span>● Pending</span><span>● Active</span><span>● Decoded</span><span>● No decode</span><span>● Failed</span>
             </div>
           </div>
           <div class="rack-scroll" tabindex="0" aria-label="Scrollable rack grid">
-            <div id="rack-grid" class="rack-grid" role="grid" aria-labelledby="rack-title"></div>
+            <div id="rack-grid" class="rack-grid"></div>
           </div>
           <div id="tube-details" class="tube-details" aria-live="polite">Select a tube to inspect its calibrated position and result.</div>
 
@@ -179,23 +182,6 @@
             <span id="tooling-chip" class="chip neutral">TOOLING UNAVAILABLE</span>
           </div>
           <div class="tool-groups">
-            <div class="tool-group">
-              <h3>Combined macros</h3>
-              <div class="controls macro-controls" aria-label="Combined Klipper and tooling macro controls">
-                <div class="control-item">
-                  <button id="macro-calibrate-button" class="secondary" title="Move to the rotary setup position and zero its position." disabled>Calibrate Rotary</button>
-                  <small>Setup position · rotary 0°</small>
-                </div>
-                <div class="control-item">
-                  <button id="macro-pickup-button" class="primary" title="Pulse release, lower to Z0, enable vacuum, then lift to Z150." disabled>Pickup</button>
-                  <small>Release · Z0 · vacuum · Z150</small>
-                </div>
-                <div class="control-item">
-                  <button id="macro-deposit-button" class="secondary" title="Move to Z20, pulse the release solenoid, then lift to Z50." disabled>Deposit</button>
-                  <small>Z20 · release · Z50</small>
-                </div>
-              </div>
-            </div>
             <div class="tool-group">
               <h3>Vacuum &amp; rotary</h3>
               <div class="controls tooling-controls" aria-label="Vacuum and rotary controls">

@@ -12,7 +12,6 @@ const state = {
   cameraImageFailed: false,
   cameraPollTimer: null,
   cameraLocateBusy: false,
-  colorRangeRecording: false,
   stereoTestBusy: false,
   cameraPickupSession: null,
   cameraPickupPreviewWasEnabled: true,
@@ -43,14 +42,12 @@ async function bootstrap() {
 
 function connectCameraPreview() {
   const image = el("camera-stream");
-  const mask = el("camera-mask-stream");
   const debug = el("camera-debug-stream");
-  for (const feed of [image, mask, debug]) {
+  for (const feed of [image, debug]) {
     feed.addEventListener("error", () => { state.cameraImageFailed = true; });
     feed.addEventListener("load", () => { state.cameraImageFailed = false; });
   }
   el("camera-preview-toggle").addEventListener("change", event => setCameraPreviewEnabled(event.target.checked));
-  el("camera-detection-mode").addEventListener("change", event => setCameraDetectionMode(event.target.value));
   for (const id of ["circle-min-distance", "circle-edge-threshold", "circle-canny-threshold"]) {
     el(id).addEventListener("input", event => {
       const value = event.currentTarget.value;
@@ -59,8 +56,6 @@ function connectCameraPreview() {
     });
   }
   el("circle-method").addEventListener("change", () => setCameraCircleParameters());
-  el("color-range-record-button").addEventListener("click", () => setColorRangeRecording(!state.colorRangeRecording));
-  el("color-range-reset-button").addEventListener("click", () => resetColorRangeRecording());
   window.addEventListener("pagehide", () => {
     if (state.cameraEnabled) {
       fetch("/api/camera/preview", {
@@ -69,28 +64,6 @@ function connectCameraPreview() {
         body: JSON.stringify({enabled: false}),
         keepalive: true,
       }).catch(() => {});
-    }
-
-    async function setColorRangeRecording(recording) {
-      const button = el("color-range-record-button");
-      button.disabled = true;
-      try {
-        const result = await api("/api/camera/color-range-recording", {recording});
-        renderCameraStatus(result);
-      } catch (error) {
-        announce(error.message);
-      } finally {
-        button.disabled = false;
-      }
-    }
-
-    async function resetColorRangeRecording() {
-      try {
-        const result = await api("/api/camera/color-range-recording", {recording: false, reset: true});
-        renderCameraStatus(result);
-      } catch (error) {
-        announce(error.message);
-      }
     }
   });
   if (["running", "failed"].includes(state.cameraPickupSession?.state)) restorePickupCameraPreview();
@@ -111,7 +84,6 @@ async function restorePickupCameraPreview() {
 async function setCameraPreviewEnabled(enabled) {
   const toggle = el("camera-preview-toggle");
   const image = el("camera-stream");
-  const mask = el("camera-mask-stream");
   const debug = el("camera-debug-stream");
   toggle.disabled = true;
   if (!enabled) {
@@ -119,10 +91,9 @@ async function setCameraPreviewEnabled(enabled) {
     window.clearTimeout(state.cameraPollTimer);
     image.removeAttribute("src");
     image.hidden = true;
-    mask.removeAttribute("src");
-    mask.hidden = true;
     debug.removeAttribute("src");
     debug.hidden = true;
+    el("camera-debug-panel").hidden = true;
     state.cameraAvailable = false;
     state.cameraImageFailed = false;
     setChip("camera-chip", "PREVIEW OFF", "neutral");
@@ -151,21 +122,6 @@ async function setCameraPreviewEnabled(enabled) {
   }
 }
 
-async function setCameraDetectionMode(mode) {
-  const selector = el("camera-detection-mode");
-  selector.disabled = true;
-  try {
-    await api("/api/camera/detection-mode", {detection_mode: mode});
-    updateCameraDetectionMode(mode);
-    refreshCameraStatus();
-  } catch (error) {
-    announce(error.message);
-    refreshCameraStatus();
-  } finally {
-    selector.disabled = false;
-  }
-}
-
 let circleParameterRequest = Promise.resolve();
 function setCameraCircleParameters() {
   const minDistance = Number(el("circle-min-distance").value);
@@ -181,16 +137,6 @@ function setCameraCircleParameters() {
       circle_method: method,
     },
   )).catch(error => announce(error.message));
-}
-
-function updateCameraDetectionMode(mode) {
-  el("camera-detection-mode").value = mode;
-  el("camera-feed-caption").textContent = mode === "hough"
-    ? "Camera + Hough circle detections (green)"
-    : "Camera + HSV locator overlay";
-  el("camera-mask-stream").parentElement.hidden = mode !== "hsv";
-  el("camera-debug-panel").hidden = mode !== "hough";
-  el("hough-tuning").hidden = mode !== "hough";
 }
 
 function setCameraFeed(id, endpoint, visible, retry = false) {
@@ -220,7 +166,6 @@ async function refreshCameraStatus() {
 
 function renderCameraStatus(status) {
   if (!state.cameraEnabled) return;
-  updateCameraDetectionMode(status.detection_mode || "hsv");
   if (Number.isFinite(Number(status.circle_min_distance))) {
     el("circle-min-distance").value = status.circle_min_distance;
     el("circle-min-distance-value").textContent = status.circle_min_distance;
@@ -234,16 +179,6 @@ function renderCameraStatus(status) {
     el("circle-canny-threshold-value").textContent = status.circle_canny_threshold;
   }
   if (status.circle_method) el("circle-method").value = status.circle_method;
-  const recordButton = el("color-range-record-button");
-  state.colorRangeRecording = Boolean(status.color_range_recording);
-  recordButton.textContent = status.color_range_recording ? "Stop recording" : "Record color range";
-  const range = status.color_range;
-  setText(
-    "color-range-values",
-    range
-      ? `H ${Number(range.hue_min).toFixed(0)}–${Number(range.hue_max).toFixed(0)}° · S ${Number(range.saturation_min).toFixed(0)}–${Number(range.saturation_max).toFixed(0)}% · V ${Number(range.value_min).toFixed(0)}–${Number(range.value_max).toFixed(0)}% · ${range.sample_count} samples`
-      : status.color_range_recording ? "Recording HSV values from the color ring…" : "HSV range recorder is idle.",
-  );
   const available = Boolean(status.available);
   const starting = ["starting", "connecting"].includes(status.state);
   setChip("camera-chip", available ? "CAMERA LIVE" : starting ? "CAMERA STARTING" : "CAMERA UNAVAILABLE", available ? "ready" : starting ? "warning" : "error");
@@ -256,8 +191,8 @@ function renderCameraStatus(status) {
   );
   const retryFeeds = available && (!state.cameraAvailable || state.cameraImageFailed);
   setCameraFeed("camera-stream", "/api/camera/stream", available, retryFeeds);
-  setCameraFeed("camera-mask-stream", "/api/camera/mask", available && status.detection_mode !== "hough", retryFeeds);
-  setCameraFeed("camera-debug-stream", "/api/camera/debug", available && status.detection_mode === "hough", retryFeeds);
+  setCameraFeed("camera-debug-stream", "/api/camera/debug", available, retryFeeds);
+  el("camera-debug-panel").hidden = !available;
   if (retryFeeds) state.cameraImageFailed = false;
   state.cameraAvailable = available;
   state.cameraImageFailed = !available;
@@ -350,7 +285,6 @@ function setCapabilities(caps, workflowState) {
   el("cancel-pickup-steps-button").hidden = !pickupRunning && !pickupFailed;
   el("cancel-pickup-steps-button").disabled = state.cameraLocateBusy || (!pickupRunning && !pickupFailed);
   el("camera-preview-toggle").disabled = state.cameraLocateBusy || pickupLocked;
-  ["macro-calibrate-button", "macro-pickup-button", "macro-deposit-button"].forEach(id => { el(id).disabled = !caps.send_gcode; });
 }
 
 function renderStepper(currentPhase, workflowState) {
@@ -362,29 +296,204 @@ function renderStepper(currentPhase, workflowState) {
   });
 }
 
+const SVG_NS = "http://www.w3.org/2000/svg";
+const RACK_GEOMETRY = {cellWidth: 48, rowDepth: 22, skew: 22, tubeRadius: 8, padX: 52, padY: 84};
+const RACK_PLANE = (() => {
+  const {cellWidth, skew, rowDepth} = RACK_GEOMETRY;
+  const a = cellWidth * cellWidth + skew * skew;
+  const b = -skew * rowDepth;
+  const d = rowDepth * rowDepth;
+  const mid = (a + d) / 2;
+  const spread = Math.hypot((a - d) / 2, b);
+  const major = Math.sqrt(mid + spread);
+  const minor = Math.sqrt(Math.max(0, mid - spread));
+  return {tilt: (Math.atan2(2 * b, a - d) * 90) / Math.PI, ratio: minor / major};
+})();
+const planeTilt = (cx, cy) => `rotate(${RACK_PLANE.tilt.toFixed(2)} ${cx} ${cy})`;
+const CAP_COLORS = {
+  gray: "#8f8f8f",
+  white: "#ededed",
+  red: "#c62828",
+  purple: "#7b4fb5",
+  magenta: "#b5429b",
+  pink: "#d16ba5",
+  green: "#1d7a3a",
+  teal: "#3aa79a",
+  "light teal": "#5cc9bd",
+  blue: "#1f6fb2",
+  yellow: "#d8a51c",
+  orange: "#d07338",
+};
+
+function svgNode(name, attributes = {}) {
+  const node = document.createElementNS(SVG_NS, name);
+  for (const [key, value] of Object.entries(attributes)) node.setAttribute(key, value);
+  return node;
+}
+
+function capColor(color) {
+  return CAP_COLORS[String(color || "").toLowerCase()] || "#9a9a9a";
+}
+
+function tubeHeightPx(rack, color) {
+  const heights = rack.color_heights_mm || {};
+  const match = Object.keys(heights).find(name => name.toLowerCase() === String(color || "").toLowerCase());
+  const fallback = Object.keys(heights).find(name => name.toLowerCase() === "gray");
+  const raw = Number(heights[match ?? fallback] ?? 30);
+  const mm = Number.isFinite(raw) && raw > 0 ? raw : 30;
+  return Math.max(22, Math.min(72, 14 + mm * 0.95));
+}
+
+function rackDefs() {
+  const defs = svgNode("defs");
+  const glass = svgNode("linearGradient", {id: "tube-glass", x1: "0", x2: "1", y1: "0", y2: "0"});
+  [
+    ["0%", "rgba(255, 255, 255, .92)"],
+    ["14%", "rgba(232, 244, 252, .72)"],
+    ["48%", "rgba(184, 214, 235, .46)"],
+    ["84%", "rgba(212, 233, 247, .62)"],
+    ["100%", "rgba(255, 255, 255, .82)"],
+  ].forEach(([offset, color]) => glass.append(svgNode("stop", {offset, "stop-color": color})));
+  defs.append(glass);
+
+  const capShade = svgNode("linearGradient", {id: "cap-shade", x1: "0", x2: "0", y1: "0", y2: "1"});
+  [
+    ["0%", "rgba(0, 0, 0, 0)"],
+    ["55%", "rgba(0, 0, 0, .05)"],
+    ["100%", "rgba(0, 0, 0, .28)"],
+  ].forEach(([offset, color]) => capShade.append(svgNode("stop", {offset, "stop-color": color})));
+  defs.append(capShade);
+  return defs;
+}
+
+function rackTube(cx, cy, tube, rack) {
+  const group = svgNode("g", {class: "rack-tube"});
+  const radius = RACK_GEOMETRY.tubeRadius;
+  const ry = radius * RACK_PLANE.ratio;
+  const height = tubeHeightPx(rack, tube.color);
+  const topY = cy - height;
+  const capHeight = 9;
+  const bodyTop = topY + capHeight;
+  const color = capColor(tube.color);
+
+  group.append(svgNode("ellipse", {cx, cy: cy + 1.5, rx: radius + 3.5, ry: (radius + 3.5) * RACK_PLANE.ratio, class: "rack-tube-shadow", transform: planeTilt(cx, cy + 1.5)}));
+  group.append(svgNode("ellipse", {cx, cy, rx: radius, ry, class: "rack-tube-glass", transform: planeTilt(cx, cy)}));
+  group.append(svgNode("rect", {x: cx - radius, y: bodyTop, width: radius * 2, height: Math.max(0, cy - bodyTop), class: "rack-tube-glass"}));
+  group.append(svgNode("line", {x1: cx - radius, y1: bodyTop, x2: cx - radius, y2: cy, class: "rack-tube-edge"}));
+  group.append(svgNode("line", {x1: cx + radius, y1: bodyTop, x2: cx + radius, y2: cy, class: "rack-tube-edge"}));
+  group.append(svgNode("rect", {x: cx - radius * 0.46, y: bodyTop + 2, width: radius * 0.3, height: Math.max(0, cy - bodyTop - 4), class: "rack-tube-glint"}));
+  group.append(svgNode("rect", {x: cx - radius, y: topY, width: radius * 2, height: capHeight, fill: color, class: "rack-tube-cap"}));
+  group.append(svgNode("rect", {x: cx - radius, y: topY, width: radius * 2, height: capHeight, fill: "url(#cap-shade)", class: "rack-tube-cap-shade"}));
+  const capTop = svgNode("g", {transform: planeTilt(cx, topY)});
+  capTop.append(svgNode("ellipse", {cx, cy: topY, rx: radius, ry, fill: color, class: "rack-tube-cap"}));
+  capTop.append(svgNode("ellipse", {cx: cx - radius * 0.28, cy: topY - ry * 0.15, rx: radius * 0.5, ry: ry * 0.5, class: "rack-tube-cap-glint"}));
+  group.append(capTop);
+  if (!tube.color) group.classList.add("provisional");
+  return group;
+}
+
 function renderRack(rack) {
-  setText("rack-title", `Rack ${rack.rows} × ${rack.columns}`);
+  setText("rack-title", `Rack ${rack.columns} × ${rack.rows}`);
   const grid = el("rack-grid");
-  grid.style.gridTemplateColumns = `30px repeat(${rack.columns}, minmax(0, 44px))`;
+  const active = document.activeElement;
+  const focusedSlot = active?.dataset?.row ? `${active.dataset.row}:${active.dataset.column}` : null;
   grid.replaceChildren();
-  const corner = document.createElement("span"); corner.className = "rack-corner"; corner.setAttribute("aria-hidden", "true"); grid.append(corner);
-  for (let column = 1; column <= rack.columns; column++) grid.append(label(`C${column}`, "column"));
-  for (let row = rack.rows; row >= 1; row--) {
-    grid.append(label(`R${row}`, "row"));
-    for (let column = 1; column <= rack.columns; column++) {
+
+  const {cellWidth, rowDepth, skew, tubeRadius, padX, padY} = RACK_GEOMETRY;
+  const rows = rack.rows;
+  const columns = rack.columns;
+  const xFor = (column, rowIndex) => padX + (column - 1) * cellWidth + rowIndex * skew;
+  const yFor = rowIndex => padY + (rows - 1 - rowIndex) * rowDepth;
+  const minX = xFor(1, 0) - cellWidth / 2 - 48;
+  const maxX = xFor(columns, rows - 1) + cellWidth / 2 + skew + 16;
+  const minY = padY - rowDepth - 80;
+  const maxY = yFor(0) + rowDepth + 32;
+
+  const svg = svgNode("svg", {
+    class: "rack-svg",
+    viewBox: `${minX} ${minY} ${maxX - minX} ${maxY - minY}`,
+    role: "grid",
+    "aria-labelledby": "rack-title",
+  });
+  svg.append(rackDefs());
+
+  const shelf = svgNode("g", {class: "rack-shelf"});
+  const nearY = yFor(0);
+  const farY = yFor(rows - 1) - rowDepth;
+  const nearLeft = xFor(1, 0) - cellWidth / 2;
+  const nearRight = xFor(columns, 0) + cellWidth / 2;
+  const farRight = xFor(columns, rows - 1) + cellWidth / 2 + skew;
+  const thickness = 12;
+  shelf.append(svgNode("polygon", {
+    points: [
+      `${nearRight},${nearY}`,
+      `${nearRight},${nearY + thickness}`,
+      `${farRight},${farY + thickness}`,
+      `${farRight},${farY}`,
+    ].join(" "),
+    class: "rack-side",
+  }));
+  shelf.append(svgNode("polygon", {
+    points: [
+      `${nearLeft},${nearY}`,
+      `${nearRight},${nearY}`,
+      `${nearRight},${nearY + thickness}`,
+      `${nearLeft},${nearY + thickness}`,
+    ].join(" "),
+    class: "rack-face",
+  }));
+  svg.append(shelf);
+
+  const labelLayer = svgNode("g", {class: "rack-labels"});
+  for (let column = 1; column <= columns; column++) {
+    const text = svgNode("text", {x: xFor(column, 0), y: yFor(0) + 30, class: "rack-axis-label", "text-anchor": "middle"});
+    text.textContent = `C${column}`;
+    labelLayer.append(text);
+  }
+
+  for (let row = rows; row >= 1; row--) {
+    const rowIndex = row - 1;
+    const rowLabel = svgNode("text", {x: xFor(1, rowIndex) - cellWidth / 2 - 22, y: yFor(rowIndex) - rowDepth / 2 + 4, class: "rack-axis-label", "text-anchor": "end"});
+    rowLabel.textContent = `R${row}`;
+    labelLayer.append(rowLabel);
+
+    for (let column = 1; column <= columns; column++) {
       const tube = rack.tubes.find(item => item.row === row && item.column === column);
-      const button = document.createElement("button");
+      const cx = xFor(column, rowIndex);
+      const frontY = yFor(rowIndex);
+      const centerX = cx + skew / 2;
+      const centerY = frontY - rowDepth / 2;
       const visual = ACTIVE_TUBES.has(tube.status) ? "active" : tube.status;
-      button.type = "button";
-      button.className = `rack-cell ${classToken(visual)}`;
-      if (state.selectedTube === `${row}:${column}`) button.classList.add("selected");
-      button.setAttribute("role", "gridcell");
-      button.setAttribute("aria-label", `Row ${row}, column ${column}, ${title(tube.status)}`);
-      button.dataset.row = row; button.dataset.column = column;
-      button.addEventListener("click", () => selectTube(tube));
-      button.addEventListener("keydown", rackKeydown);
-      grid.append(button);
+      const selected = state.selectedTube === `${row}:${column}`;
+      const slot = svgNode("g", {class: `rack-slot ${classToken(visual)}${selected ? " selected" : ""}`, role: "gridcell", tabindex: "0"});
+      slot.dataset.row = row;
+      slot.dataset.column = column;
+      slot.setAttribute("aria-label", `Row ${row}, column ${column}, ${title(tube.status)}${tube.color ? `, ${tube.color} cap` : ""}`);
+      const slotTitle = svgNode("title");
+      slotTitle.textContent = `R${row} C${column} · ${title(tube.status)}${tube.color ? ` · ${tube.color} cap` : ""}`;
+      slot.append(slotTitle);
+      slot.append(svgNode("polygon", {
+        points: [
+          `${cx - cellWidth / 2 + 2},${frontY}`,
+          `${cx + cellWidth / 2 - 2},${frontY}`,
+          `${cx + cellWidth / 2 + skew - 2},${frontY - rowDepth}`,
+          `${cx - cellWidth / 2 + skew + 2},${frontY - rowDepth}`,
+        ].join(" "),
+        class: "rack-slot-top",
+      }));
+      slot.append(svgNode("ellipse", {cx: centerX, cy: centerY, rx: tubeRadius + 1.5, ry: (tubeRadius + 1.5) * RACK_PLANE.ratio, class: "rack-hole", transform: planeTilt(centerX, centerY)}));
+      if (tube.color || selected) slot.append(rackTube(centerX, centerY, tube, rack));
+      slot.addEventListener("click", () => selectTube(tube));
+      slot.addEventListener("keydown", rackKeydown);
+      svg.append(slot);
     }
+  }
+
+  svg.append(labelLayer);
+  grid.append(svg);
+  if (focusedSlot) {
+    const [row, column] = focusedSlot.split(":");
+    grid.querySelector(`[data-row="${row}"][data-column="${column}"]`)?.focus();
   }
   if (state.selectedTube) {
     const [row, column] = state.selectedTube.split(":").map(Number);
@@ -392,7 +501,6 @@ function renderRack(rack) {
     if (selected) showTubeDetails(selected);
   }
 }
-function label(text, kind) { const node = document.createElement("span"); node.className = `rack-label ${kind}`; node.textContent = text; node.setAttribute("aria-hidden", "true"); return node; }
 function selectTube(tube) { state.selectedTube = `${tube.row}:${tube.column}`; renderRack(state.snapshot.rack); showTubeDetails(tube); renderLocateTubePlan(tube); document.querySelector(`[data-row="${tube.row}"][data-column="${tube.column}"]`)?.focus(); if (state.snapshot) setCapabilities(state.snapshot.capabilities, state.snapshot.workflow.state); }
 function renderLocateTubePlan(tube) {
   const rack = state.snapshot.rack;
@@ -450,6 +558,10 @@ function renderCameraPickupSession(session) {
 function showTubeDetails(tube) {
   const p = tube.position_mm;
   const details = [`R${tube.row} C${tube.column}`, title(tube.status), `attempts ${tube.yaw_attempt}/${tube.yaw_attempt_total}`, `X ${number(p.x)} Y ${number(p.y)} Z ${number(p.z)}`];
+  if (tube.color) {
+    const heightMm = state.snapshot?.rack?.color_heights_mm?.[tube.color];
+    details.push(`cap ${tube.color}${Number.isFinite(Number(heightMm)) ? ` · ${number(heightMm)} mm` : ""}`);
+  }
   if (tube.decoded_payload) details.push(`payload: ${tube.decoded_payload}`);
   if (tube.confidence != null) details.push(`confidence ${number(tube.confidence)}`);
   if (tube.error) details.push(`error: ${tube.error}`);
@@ -490,9 +602,6 @@ function wireControls() {
   });
   el("pause-button").addEventListener("click", () => act(state.snapshot?.workflow.state === "paused" ? "/api/workflow/resume" : "/api/workflow/pause"));
   el("stop-button").addEventListener("click", async () => { if (confirm("Stop after the active command? This is not an emergency stop.")) await act("/api/workflow/stop"); });
-  el("macro-calibrate-button").addEventListener("click", () => act("/api/macros/calibrate"));
-  el("macro-pickup-button").addEventListener("click", () => act("/api/macros/pickup"));
-  el("macro-deposit-button").addEventListener("click", () => act("/api/macros/deposit"));
   el("tooling-release-button").addEventListener("click", () => act("/api/tooling/release"));
   el("tooling-vacuum-button").addEventListener("click", () => act("/api/tooling/vacuum"));
   el("tooling-vacuum-off-button").addEventListener("click", () => act("/api/tooling/vacuum/off"));

@@ -161,10 +161,12 @@ class WebTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn('id="console-card"', html)
         self.assertIn('id="camera-preview-toggle" type="checkbox"', html)
         self.assertIn('id="camera-stream" alt=', html)
-        self.assertIn('id="camera-mask-stream" alt=', html)
         self.assertIn('id="camera-debug-stream" alt=', html)
-        self.assertIn('id="camera-debug-stream" alt=', html)
-        self.assertIn('id="camera-detection-mode"', html)
+        self.assertNotIn('id="camera-mask-stream"', html)
+        self.assertNotIn('id="camera-detection-mode"', html)
+        self.assertNotIn("Record color range", html)
+        self.assertNotIn("Combined macros", html)
+        self.assertNotIn('id="macro-pickup-button"', html)
         self.assertNotIn('src="/api/camera/stream"', html)
         self.assertIn('id="locate-tube-plan-steps"', html)
         self.assertIn('id="locate-tube-steps"', html)
@@ -183,6 +185,11 @@ class WebTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(status["rack"]["tubes"]), 72)
         self.assertEqual(status["rack"]["pickup_height_mm"], self.settings.rack.pickup_height_mm)
         self.assertEqual(status["rack"]["scan_height_mm"], self.settings.rack.scan_height_mm)
+        self.assertEqual(
+            status["rack"]["color_heights_mm"],
+            dict(self.settings.rack.pickup_height_offset_mm_by_color),
+        )
+        self.assertIsNone(status["rack"]["tubes"][0]["color"])
         self.assertNotIn("plan", status["workflow"])
         self.assertNotIn("moonraker", status)
 

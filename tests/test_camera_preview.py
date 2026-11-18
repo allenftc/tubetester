@@ -213,7 +213,7 @@ class CameraPreviewTests(unittest.TestCase):
         self.assertEqual(status["state"], "streaming")
         self.assertEqual(status["width"], PREVIEW_WIDTH)
         self.assertEqual(status["height"], PREVIEW_HEIGHT)
-        self.assertEqual(status["detection_mode"], "hsv")
+        self.assertEqual(status["detection_mode"], "hough")
         self.assertEqual(
             FakeCapture.instances[0].requested_size,
             {

@@ -22,7 +22,7 @@ HOUGH_GRADIENT_ALT = "gradient_alt"
 # Support is scored in [0, 1], so 0.5 lets a centrally located circle beat a
 # stronger edge elsewhere while still preferring a well-supported ring when two
 # candidates are similarly close to the center.
-CIRCLE_PROXIMITY_BONUS = 0.5
+CIRCLE_PROXIMITY_BONUS = 0.9
 
 
 @dataclass(frozen=True)

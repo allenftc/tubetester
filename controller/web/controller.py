@@ -187,6 +187,7 @@ class WorkflowController(MachineActions, CameraPickupActions, WorkflowControlAct
                 "pickup_height_mm": self.settings.rack.pickup_height_mm,
                 "scan_height_mm": self.settings.rack.scan_height_mm,
                 "scan_height_with_offset_mm": self.settings.rack.scan_height_with_offset_mm,
+                "color_heights_mm": dict(self.settings.rack.pickup_height_offset_mm_by_color),
                 "tubes": tubes,
             },
             "capabilities": capabilities,
@@ -354,6 +355,7 @@ class WorkflowController(MachineActions, CameraPickupActions, WorkflowControlAct
                     "yaw_attempt": 0,
                     "yaw_attempt_total": len(self.settings.yaw.sweep_angles()),
                     "decoded_payload": None,
+                    "color": None,
                     "confidence": None,
                     "frame_id": None,
                     "error": None,
@@ -394,6 +396,10 @@ class WorkflowController(MachineActions, CameraPickupActions, WorkflowControlAct
 
     def _tube(self, row: int, column: int) -> dict[str, Any]:
         return self._tubes[(row - 1) * self.settings.rack.columns + column - 1]
+
+    async def _record_tube_color(self, row: int, column: int, color: str) -> None:
+        async with self._lock:
+            self._tube(row, column)["color"] = color
 
     def _update_percent_and_summary(self) -> None:
         progress = self._workflow["progress"]
