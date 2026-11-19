@@ -44,6 +44,7 @@ def create_control_app(
     app.router.add_post("/api/camera/detection-mode", _camera_detection_mode)
     app.router.add_post("/api/camera/circle-parameters", _camera_circle_parameters)
     app.router.add_post("/api/camera/color-range-recording", _camera_color_range_recording)
+    app.router.add_post("/api/camera/photo", _camera_photo)
     app.router.add_post("/api/actions/home", _home)
     app.router.add_post("/api/actions/preview", _preview)
     app.router.add_post("/api/actions/locate-tube", _locate_tube)
@@ -196,6 +197,23 @@ async def _camera_color_range_recording(request: web.Request) -> web.Response:
         preview.reset_color_range_recording()
     preview.set_color_range_recording(recording)
     return web.json_response({"ok": True, **preview.status()})
+
+
+async def _camera_photo(request: web.Request) -> web.Response:
+    await _json_body(request, allow_empty=True)
+    preview: CameraPreviewService = request.app["camera_preview"]
+    was_running = preview.status()["state"] not in {"not_started", "stopped", "stopping"}
+    started_by_request = not was_running
+    if started_by_request:
+        await asyncio.to_thread(preview.start)
+    try:
+        photo = await asyncio.to_thread(preview.take_photo)
+    except RuntimeError as exc:
+        raise RuntimeUnavailable(str(exc)) from exc
+    finally:
+        if started_by_request:
+            await asyncio.to_thread(preview.stop)
+    return web.json_response({"ok": True, "action": "camera.photo", **photo})
 
 
 async def _camera_stream(request: web.Request) -> web.StreamResponse:

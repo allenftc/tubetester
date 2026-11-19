@@ -48,6 +48,7 @@ function connectCameraPreview() {
     feed.addEventListener("load", () => { state.cameraImageFailed = false; });
   }
   el("camera-preview-toggle").addEventListener("change", event => setCameraPreviewEnabled(event.target.checked));
+  el("take-photo-button").addEventListener("click", takePhoto);
   for (const id of ["circle-min-distance", "circle-edge-threshold", "circle-canny-threshold"]) {
     el(id).addEventListener("input", event => {
       const value = event.currentTarget.value;
@@ -119,6 +120,23 @@ async function setCameraPreviewEnabled(enabled) {
     }
   } finally {
     toggle.disabled = state.cameraLocateBusy || ["running", "failed"].includes(state.cameraPickupSession?.state);
+  }
+}
+
+async function takePhoto() {
+  const button = el("take-photo-button");
+  button.disabled = true;
+  setText("camera-photo-status", "Capturing a raw frame…");
+  try {
+    const result = await api("/api/camera/photo");
+    setText("camera-photo-status", `Saved ${result.filename} (${result.width} × ${result.height}) to the project root.`);
+    announce(`Saved photo ${result.filename}.`);
+  } catch (error) {
+    setText("camera-photo-status", error.message);
+    announce(error.message);
+    alert(error.message);
+  } finally {
+    button.disabled = false;
   }
 }
 

@@ -14,6 +14,7 @@ from controller.web.actions import CameraPickupActions, MachineActions, Workflow
 
 _ACTIVE_STATES = {"starting", "running", "paused", "stopping"}
 _TERMINAL_STATES = {"idle", "stopped", "completed", "failed"}
+_DEFAULT_MACHINE_POLL_SECONDS = 5.0
 
 
 class QrBackend(Protocol):
@@ -36,6 +37,8 @@ class WorkflowController(MachineActions, CameraPickupActions, WorkflowControlAct
         moonraker: MoonrakerClient | None = None,
         events: EventStore | None = None,
         qr_backend: QrBackend | None = None,
+        *,
+        poll_interval_seconds: float | None = None,
     ) -> None:
         self.settings = settings
         self.moonraker = moonraker or MoonrakerClient(settings.network.moonraker)
@@ -44,6 +47,7 @@ class WorkflowController(MachineActions, CameraPickupActions, WorkflowControlAct
         self.motion = KlipperMotionClient()
         self.workflow_builder = TubeScanWorkflow(settings)
         self._lock = asyncio.Lock()
+        self._refresh_lock = asyncio.Lock()
         self._manual_macro_lock = asyncio.Lock()
         self._hardware_lock = asyncio.Lock()
         self._hardware_initialized = False
@@ -54,6 +58,10 @@ class WorkflowController(MachineActions, CameraPickupActions, WorkflowControlAct
         self._pause_gate.set()
         self._stop_requested = asyncio.Event()
         self._task: asyncio.Task[None] | None = None
+        self._poll_interval_seconds = (
+            _DEFAULT_MACHINE_POLL_SECONDS if poll_interval_seconds is None else poll_interval_seconds
+        )
+        self._monitor_task: asyncio.Task[None] | None = None
         self._held_tube = False
         self._machine = {
             "connected": False,
@@ -71,8 +79,17 @@ class WorkflowController(MachineActions, CameraPickupActions, WorkflowControlAct
 
     async def initialize(self) -> None:
         await self.refresh_machine()
+        self._start_machine_monitor()
 
     async def close(self) -> None:
+        monitor = self._monitor_task
+        self._monitor_task = None
+        if monitor and not monitor.done():
+            monitor.cancel()
+            try:
+                await monitor
+            except (asyncio.CancelledError, Exception):
+                pass
         if self._task and not self._task.done():
             self._stop_requested.set()
             self._pause_gate.set()
@@ -81,41 +98,69 @@ class WorkflowController(MachineActions, CameraPickupActions, WorkflowControlAct
             except (TimeoutError, asyncio.CancelledError):
                 self._task.cancel()
 
+    def _start_machine_monitor(self) -> None:
+        if self._monitor_task and not self._monitor_task.done():
+            return
+        self._monitor_task = asyncio.create_task(self._monitor_machine(), name="machine-monitor")
+
+    async def _monitor_machine(self) -> None:
+        """Keep machine state fresh so readiness recovers without a restart."""
+        while True:
+            await asyncio.sleep(self._poll_interval_seconds)
+            try:
+                await self.refresh_machine()
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                # refresh_machine already guards hardware errors; keep polling.
+                continue
+
     async def refresh_machine(self) -> None:
-        try:
-            response = await asyncio.to_thread(self.moonraker.get_printer_info)
-        except Exception as exc:  # defensive boundary around hardware adapter
-            response = MoonrakerResponse(False, 0, error_message=str(exc))
-        async with self._lock:
-            if not response.ok:
-                changed = self._machine["connected"] or self._machine["klipper_state"] != "offline"
-                self._machine.update(
-                    connected=False,
-                    klipper_state="offline",
-                    state_message="Moonraker is unreachable.",
-                    position_mm=None,
-                    homed_axes=[],
+        async with self._refresh_lock:
+            try:
+                response = await asyncio.to_thread(self.moonraker.get_printer_info)
+            except Exception as exc:  # defensive boundary around hardware adapter
+                response = MoonrakerResponse(False, 0, error_message=str(exc))
+            async with self._lock:
+                previous = (
+                    self._machine["connected"],
+                    self._machine["klipper_state"],
+                    self._machine["state_message"],
                 )
-                self._hardware_initialized = False
-                if changed:
-                    self.events.publish(
-                        f"Moonraker connection failed: {response.error_message or 'unavailable'}",
-                        source="moonraker",
-                        level="error",
+                if not response.ok:
+                    self._machine.update(
+                        connected=False,
+                        klipper_state="offline",
+                        state_message="Moonraker is unreachable.",
+                        position_mm=None,
+                        homed_axes=[],
                     )
-            else:
-                result = (response.payload or {}).get("result", response.payload or {})
-                state = str(result.get("state", "ready")).lower()
-                self._machine.update(
-                    connected=True,
-                    klipper_state=state,
-                    state_message=str(result.get("state_message", "Printer information received.")),
-                )
-                if state != "ready":
                     self._hardware_initialized = False
-        if response.ok and self._machine["klipper_state"] == "ready":
-            await self._initialize_tooling()
-        self._broadcast_status()
+                    if previous[0] or previous[1] != "offline":
+                        self.events.publish(
+                            f"Moonraker connection failed: {response.error_message or 'unavailable'}",
+                            source="moonraker",
+                            level="error",
+                        )
+                else:
+                    result = (response.payload or {}).get("result", response.payload or {})
+                    state = str(result.get("state", "ready")).lower()
+                    self._machine.update(
+                        connected=True,
+                        klipper_state=state,
+                        state_message=str(result.get("state_message", "Printer information received.")),
+                    )
+                    if state != "ready":
+                        self._hardware_initialized = False
+                changed = previous != (
+                    self._machine["connected"],
+                    self._machine["klipper_state"],
+                    self._machine["state_message"],
+                )
+            if response.ok and self._machine["klipper_state"] == "ready":
+                await self._initialize_tooling()
+            if changed:
+                self._broadcast_status()
 
     async def _initialize_tooling(self) -> None:
         async with self._hardware_lock:

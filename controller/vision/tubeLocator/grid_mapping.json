@@ -3,51 +3,50 @@
   "coordinate_units": "mm",
   "pixel_to_world_homography": [
     [
-      0.14194266049010226,
-      0.14464619193812078,
-      -53.39927357833438
+      0.18019287369869388,
+      0.17957743683590033,
+      -60.08284064837487
     ],
     [
-      0.14394302993138305,
-      -0.14162951661588674,
-      -32.603382805068826
+      0.1786814510828655,
+      -0.18093260999125343,
+      -24.78449559761731
     ],
     [
-      1.0885592886550376e-05,
-      2.1328595733900158e-05,
+      8.902386455349605e-06,
+      1.575346761254155e-05,
       1.0
     ]
   ],
   "world_to_pixel_homography": [
     [
-      3.427138047272059,
-      3.545101072167533,
-      298.5889695155373
+      2.7908854618841605,
+      2.790603836534635,
+      236.84803497553875
     ],
     [
-      3.5089367099750053,
-      -3.465797963597841,
-      74.37793361280745
+      2.765532579982232,
+      -2.7937543186028995,
+      96.91926170072355
     ],
     [
-      -0.00011214712209150942,
-      3.533007664766375e-05,
-      0.9951633051598888
+      -6.841226886448824e-05,
+      1.916828437889628e-05,
+      1.0
     ]
   ],
-  "checkerboard_inner_corners": [
-    0,
-    0
-  ],
+  "checkerboard_inner_corners": null,
   "grid_pixel_ids": null,
   "grid_indices": null,
   "manual_coordinates_are_absolute": false,
   "pitch": 20.2,
   "origin_offset": [
-    0.0,
-    0.0
+    10.1,
+    10.1
   ],
   "camera_to_board_distance": null,
-  "mean_corner_reprojection_error": 0.28542908553535323,
-  "mapping_scope": "the checkerboard/work-surface plane only"
+  "mean_corner_reprojection_error": 0.25331126610942756,
+  "mapping_scope": "the rack top-surface plane only",
+  "source_image": "photo_20261119_001704_655.png (640x480 raw pixels, no undistortion)",
+  "notes": "Fit to 29 rail-top intersections at multiples of 20.2 mm. Slot (i,j) center = (i*20.2+10.1, j*20.2+10.1) mm; green-tube slot is (0,0). +X toward image lower-right, +Y toward image upper-right (same axes as the previous mapping)."
 }

@@ -7,9 +7,9 @@
   <meta name="theme-color" content="#f3f3f3" media="(prefers-color-scheme: light)">
   <meta name="theme-color" content="#202020" media="(prefers-color-scheme: dark)">
   <title>Tube Tester Control</title>
-  <link rel="stylesheet" href="/static/app.css?v=15">
-  <link rel="stylesheet" href="/static/rack.css?v=15">
-  <script src="/static/app.js?v=15" defer></script>
+  <link rel="stylesheet" href="/static/app.css?v=16">
+  <link rel="stylesheet" href="/static/rack.css?v=16">
+  <script src="/static/app.js?v=16" defer></script>
 </head>
 <body>
   <div id="stale-banner" class="stale-banner" role="status" hidden>Live connection interrupted. Reconnecting…</div>
@@ -52,6 +52,7 @@
 
         <div class="camera-settings">
           <label for="camera-preview-toggle"><input id="camera-preview-toggle" type="checkbox"> Live preview</label>
+          <button id="take-photo-button" class="secondary" type="button" title="Capture a raw 640 × 480 frame and save it as a PNG in the project root.">Take Picture</button>
         </div>
 
         <details id="hough-tuning" class="config-details">
@@ -92,6 +93,7 @@
           </div>
         </div>
         <p id="camera-details" class="muted" role="status">Preview is off. Camera capture is stopped.</p>
+        <p id="camera-photo-status" class="muted" role="status" aria-live="polite">Photos are saved as 640 × 480 PNGs in the project root.</p>
       </section>
 
       <div class="side-column">

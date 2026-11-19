@@ -89,6 +89,21 @@ class FakeCameraPreview:
         self.detection_mode = mode
 
 
+class FakePhotoCameraPreview(FakeCameraPreview):
+    def __init__(self) -> None:
+        super().__init__()
+        self.photo_directory: Path | None = None
+
+    def take_photo(self, *, timeout_seconds: float = 8.0, directory: Path | None = None) -> dict[str, object]:
+        self.photo_directory = Path(directory) if directory is not None else None
+        return {
+            "filename": "photo_test.png",
+            "path": "/project/photo_test.png",
+            "width": 640,
+            "height": 480,
+        }
+
+
 class FakeDetectionCameraPreview(FakeCameraPreview):
     def __init__(
         self,
@@ -156,7 +171,7 @@ class WebTests(unittest.IsolatedAsyncioTestCase):
         index = await self.client.get("/")
         html = await index.text()
         self.assertEqual(index.status, 200)
-        for landmark in ("Home Machine", "Preview Run", "Start Scan", "Rack 6 × 12", "Begin Pickup Steps", "Run Next Step", "Cancel Steps"):
+        for landmark in ("Home Machine", "Preview Run", "Start Scan", "Rack 6 × 12", "Begin Pickup Steps", "Run Next Step", "Cancel Steps", "Take Picture"):
             self.assertIn(landmark, html)
         self.assertNotIn('id="console-card"', html)
         self.assertIn('id="camera-preview-toggle" type="checkbox"', html)
@@ -254,6 +269,27 @@ class WebTests(unittest.IsolatedAsyncioTestCase):
 
             invalid = await client.post("/api/camera/detection-mode", json={"detection_mode": "circle"})
             self.assertEqual(invalid.status, 400)
+        finally:
+            await client.close()
+
+    async def test_camera_photo_endpoint_captures_raw_frame(self) -> None:
+        preview = FakePhotoCameraPreview()
+        client = TestClient(TestServer(create_control_app(
+            self.settings,
+            runtime=self.runtime,
+            camera_preview=preview,
+            initialize_hardware=False,
+        )))
+        await client.start_server()
+        try:
+            response = await client.post("/api/camera/photo", json={})
+            payload = await response.json()
+            self.assertEqual(response.status, 200)
+            self.assertEqual(payload["action"], "camera.photo")
+            self.assertEqual(payload["filename"], "photo_test.png")
+            self.assertEqual(payload["width"], 640)
+            self.assertEqual(payload["height"], 480)
+            self.assertFalse(preview.started)
         finally:
             await client.close()
 
@@ -528,6 +564,31 @@ class WebTests(unittest.IsolatedAsyncioTestCase):
 
 
 class RuntimeTests(unittest.IsolatedAsyncioTestCase):
+    async def test_machine_monitor_recovers_when_klipper_becomes_ready(self) -> None:
+        settings = load_settings(Path(__file__).resolve().parents[1] / "calibration")
+        moonraker = FakeMoonraker(ready=False)
+        runtime = WorkflowRuntime(settings, moonraker=moonraker, poll_interval_seconds=0.01)
+        await runtime.initialize()
+        try:
+            snapshot = await runtime.snapshot()
+            self.assertFalse(snapshot["machine"]["connected"])
+            self.assertEqual(snapshot["machine"]["klipper_state"], "offline")
+
+            moonraker.ready = True
+            for _ in range(100):
+                snapshot = await runtime.snapshot()
+                if snapshot["machine"]["klipper_state"] == "ready":
+                    break
+                await asyncio.sleep(0.01)
+
+            self.assertTrue(snapshot["machine"]["connected"])
+            self.assertEqual(snapshot["machine"]["klipper_state"], "ready")
+            self.assertEqual(moonraker.commands, [
+                "SET_PIN PIN=solenoid VALUE=0\nSET_PIN PIN=vacuum_pump VALUE=0",
+            ])
+        finally:
+            await runtime.close()
+
     async def test_locate_tube_rejects_pickup_height_at_safe_z_before_motion(self) -> None:
         settings = load_settings(Path(__file__).resolve().parents[1] / "calibration")
         settings = replace(settings, rack=replace(settings.rack, pickup_height_mm=settings.rack.safe_z_mm))

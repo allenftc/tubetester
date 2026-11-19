@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+import tempfile
 import unittest
 from unittest.mock import patch
 
@@ -234,6 +235,36 @@ class CameraPreviewTests(unittest.TestCase):
             "height": round(settings.roi_height * PREVIEW_HEIGHT / settings.resolution.height),
         })
         self.assertIsInstance(status["tube_present"], bool)
+
+    def test_take_photo_saves_raw_640x480_png(self) -> None:
+        settings = load_settings(Path(__file__).resolve().parents[1] / "calibration").camera
+        preview = CameraPreviewService(settings, fps=10)
+
+        with (
+            patch("controller.vision.camera_preview.cv2.VideoCapture", FakeCapture),
+            tempfile.TemporaryDirectory() as directory,
+        ):
+            preview.start()
+            preview.wait_for_frame(0, timeout_seconds=3)
+            photo = preview.take_photo(directory=Path(directory), timeout_seconds=3)
+            preview.stop()
+
+            self.assertEqual(photo["width"], PREVIEW_WIDTH)
+            self.assertEqual(photo["height"], PREVIEW_HEIGHT)
+            path = Path(photo["path"])
+            self.assertEqual(path.parent, Path(directory))
+            self.assertTrue(path.is_file())
+            image = cv2.imread(str(path), cv2.IMREAD_COLOR)
+            self.assertIsNotNone(image)
+            self.assertEqual(image.shape[:2], (PREVIEW_HEIGHT, PREVIEW_WIDTH))
+
+    def test_take_photo_requires_a_running_preview(self) -> None:
+        settings = load_settings(Path(__file__).resolve().parents[1] / "calibration").camera
+        preview = CameraPreviewService(settings)
+
+        with tempfile.TemporaryDirectory() as directory:
+            with self.assertRaisesRegex(RuntimeError, "camera preview"):
+                preview.take_photo(directory=Path(directory), timeout_seconds=0.1)
 
     def test_detection_mode_can_be_switched_and_rejects_unknown_modes(self) -> None:
         settings = load_settings(Path(__file__).resolve().parents[1] / "calibration").camera

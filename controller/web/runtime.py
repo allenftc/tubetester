@@ -19,8 +19,16 @@ class WorkflowRuntime:
         moonraker: MoonrakerClient | None = None,
         events: EventStore | None = None,
         qr_backend: QrBackend | None = None,
+        *,
+        poll_interval_seconds: float | None = None,
     ) -> None:
-        self._controller = WorkflowController(settings, moonraker, events, qr_backend)
+        self._controller = WorkflowController(
+            settings,
+            moonraker,
+            events,
+            qr_backend,
+            poll_interval_seconds=poll_interval_seconds,
+        )
 
     def __getattr__(self, name: str) -> Any:
         return getattr(self._controller, name)

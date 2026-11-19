@@ -4,6 +4,7 @@ import sys
 import threading
 import time
 from collections import deque
+from pathlib import Path
 from typing import Any
 
 import cv2
@@ -15,6 +16,7 @@ from controller.vision.tubeLocator.tube_locator import HOUGH_GRADIENT, TubeLocat
 
 PREVIEW_WIDTH = 640
 PREVIEW_HEIGHT = 480
+PHOTO_DIRECTORY = Path(__file__).resolve().parents[2]
 
 
 class CameraPreviewService:
@@ -29,6 +31,11 @@ class CameraPreviewService:
         self._stop_event = threading.Event()
         self._thread: threading.Thread | None = None
         self._capture: cv2.VideoCapture | None = None
+        self._photo_lock = threading.Lock()
+        self._photo_requested = False
+        self._photo_directory = PHOTO_DIRECTORY
+        self._photo_result: dict[str, Any] | None = None
+        self._photo_error: str | None = None
         self._sequence = 0
         self._jpeg: bytes | None = None
         self._mask_jpeg: bytes | None = None
@@ -76,6 +83,9 @@ class CameraPreviewService:
                 self._jpeg = None
                 self._mask_jpeg = None
                 self._debug_jpeg = None
+                self._photo_requested = False
+                self._photo_result = None
+                self._photo_error = None
             self._set_status(state="starting", message=f"Opening {self._device_name()}.")
             self._thread = threading.Thread(target=self._capture_loop, name="camera-preview", daemon=True)
             self._thread.start()
@@ -127,6 +137,41 @@ class CameraPreviewService:
                 if self._status["detected_offset_roi"] is not None
                 else None,
             }
+
+    def take_photo(self, *, timeout_seconds: float = 8.0, directory: Path | None = None) -> dict[str, Any]:
+        """Save the next raw (unannotated) camera frame as a 640x480 PNG."""
+        target_directory = Path(directory) if directory is not None else PHOTO_DIRECTORY
+        with self._photo_lock:
+            with self._condition:
+                if (
+                    self._thread is None
+                    or not self._thread.is_alive()
+                    or self._stop_event.is_set()
+                    or self._status["state"] in {"not_started", "stopped", "stopping"}
+                ):
+                    raise RuntimeError("Turn on the camera preview before taking a picture.")
+                self._photo_directory = target_directory
+                self._photo_result = None
+                self._photo_error = None
+                self._photo_requested = True
+                self._condition.notify_all()
+                self._condition.wait_for(
+                    lambda: self._photo_result is not None
+                    or self._photo_error is not None
+                    or self._stop_event.is_set()
+                    or self._status["state"] in {"unavailable", "error", "stopped"},
+                    timeout=timeout_seconds,
+                )
+                result = self._photo_result
+                error = self._photo_error
+                self._photo_requested = False
+                self._photo_result = None
+                self._photo_error = None
+            if error is not None:
+                raise RuntimeError(error)
+            if result is None:
+                raise RuntimeError("The camera did not provide a frame in time.")
+            return result
 
     def set_detection_mode(self, mode: str) -> None:
         if mode not in {"hsv", "hough"}:
@@ -343,6 +388,7 @@ class CameraPreviewService:
                             )
                             break
 
+                        self._service_photo_request(frame)
                         frame, roi = self._prepare_preview_frame(frame)
                         with self._condition:
                             detection_mode = self._detection_mode
@@ -480,6 +526,45 @@ class CameraPreviewService:
             capture.set(cv2.CAP_PROP_FRAME_WIDTH, PREVIEW_WIDTH)
             capture.set(cv2.CAP_PROP_FRAME_HEIGHT, PREVIEW_HEIGHT)
         return capture
+
+    def _service_photo_request(self, frame: np.ndarray) -> None:
+        with self._condition:
+            if not self._photo_requested:
+                return
+            directory = self._photo_directory
+        try:
+            path = self._write_photo(frame, directory)
+        except Exception as exc:
+            with self._condition:
+                self._photo_requested = False
+                self._photo_error = f"OpenCV could not save the camera photo: {exc}"
+                self._condition.notify_all()
+            return
+        with self._condition:
+            self._photo_requested = False
+            self._photo_result = {
+                "filename": path.name,
+                "path": str(path),
+                "width": PREVIEW_WIDTH,
+                "height": PREVIEW_HEIGHT,
+            }
+            self._condition.notify_all()
+
+    @staticmethod
+    def _write_photo(frame: np.ndarray, directory: Path) -> Path:
+        height, width = frame.shape[:2]
+        if (width, height) != (PREVIEW_WIDTH, PREVIEW_HEIGHT):
+            frame = cv2.resize(
+                frame,
+                (PREVIEW_WIDTH, PREVIEW_HEIGHT),
+                interpolation=cv2.INTER_AREA if width > PREVIEW_WIDTH else cv2.INTER_LINEAR,
+            )
+        directory.mkdir(parents=True, exist_ok=True)
+        stamp = time.strftime("%Y%m%d_%H%M%S")
+        path = directory / f"photo_{stamp}_{int(time.time() * 1000) % 1000:03d}.png"
+        if not cv2.imwrite(str(path), frame):
+            raise OSError(f"OpenCV could not write {path}.")
+        return path
 
     def _prepare_preview_frame(
         self,
