@@ -7,7 +7,7 @@
   "rows": 12,
   "camera_offset_mm": {"x": 23.3, "y": -20.8, "z": 0.0},
   "pixel_to_mm_multiplier": 0.425,
-  "pickup_height_mm": -7,
+  "pickup_height_mm": -10,
   "pickup_height_offset_mm_by_color": {
     "gray": 39.0,
     "white": 10.0,
@@ -17,6 +17,6 @@
     "light teal": 49.9
   },
   "scan_height_mm": 45,
-  "scan_height_with_offset": 30,
+  "scan_height_with_offset": 16,
   "post_pickup_height_mm": 150
 }
