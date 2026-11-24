@@ -1,10 +1,6 @@
 from __future__ import annotations
 
 import argparse
-import os
-import sys
-import threading
-import time
 from pathlib import Path
 
 import cv2
@@ -52,33 +48,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--reload",
         action="store_true",
-        help="Restart automatically when Python or calibration files change.",
+        help=(
+            "Watch Python and calibration files and apply changes in-process "
+            "(no process restart; use with --serve-web)."
+        ),
     )
     return parser
-
-
-def _snapshot_watch_files(root: Path) -> dict[str, float]:
-    snapshot: dict[str, float] = {}
-    for path in root.rglob("*"):
-        if not path.is_file():
-            continue
-        if path.suffix not in {".py", ".json"}:
-            continue
-        try:
-            snapshot[str(path)] = path.stat().st_mtime
-        except OSError:
-            continue
-    return snapshot
-
-
-def _start_reload_watcher(root: Path, poll_interval: float = 1.0) -> None:
-    initial_snapshot = _snapshot_watch_files(root)
-    while True:
-        time.sleep(poll_interval)
-        current_snapshot = _snapshot_watch_files(root)
-        if current_snapshot != initial_snapshot:
-            print("Detected source or calibration change. Reloading...")
-            os.execvp(sys.executable, [sys.executable, "-m", "controller.main", *sys.argv[1:]])
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -94,15 +69,7 @@ def main(argv: list[str] | None = None) -> int:
         return 0
 
     if args.serve_web:
-        if args.reload:
-            repo_root = Path(__file__).resolve().parents[1]
-            watcher = threading.Thread(
-                target=_start_reload_watcher,
-                args=(repo_root,),
-                daemon=True,
-            )
-            watcher.start()
-        serve_control_server(settings)
+        serve_control_server(settings, config_dir=args.config_dir, watch=args.reload)
         return 0
 
     if args.scan_camera:

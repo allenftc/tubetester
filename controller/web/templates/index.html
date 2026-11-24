@@ -7,9 +7,9 @@
   <meta name="theme-color" content="#f3f3f3" media="(prefers-color-scheme: light)">
   <meta name="theme-color" content="#202020" media="(prefers-color-scheme: dark)">
   <title>Tube Tester Control</title>
-  <link rel="stylesheet" href="/static/app.css?v=16">
-  <link rel="stylesheet" href="/static/rack.css?v=16">
-  <script src="/static/app.js?v=16" defer></script>
+  <link rel="stylesheet" href="/static/app.css?v=17">
+  <link rel="stylesheet" href="/static/rack.css?v=17">
+  <script src="/static/app.js?v=17" defer></script>
 </head>
 <body>
   <div id="stale-banner" class="stale-banner" role="status" hidden>Live connection interrupted. Reconnecting…</div>
@@ -216,6 +216,24 @@
         </section>
       </div>
     </div>
+
+    <section id="caps3d-card" class="caps3d-card card" aria-labelledby="caps3d-title">
+      <div class="section-heading">
+        <div><p class="eyebrow">VISION</p><h2 id="caps3d-title">Cap 3D view</h2></div>
+        <div class="caps3d-toolbar">
+          <span id="caps3d-chip" class="chip neutral">CAMERA OFF</span>
+          <button id="caps3d-reset" class="secondary" type="button" title="Reset the orbit camera.">Reset view</button>
+        </div>
+      </div>
+      <div class="caps3d-stage">
+        <canvas id="caps3d-canvas" aria-label="Three-dimensional view of the rack with detected tube caps"></canvas>
+        <p id="caps3d-empty" class="caps3d-empty">Turn on the camera preview to place detected caps in 3D.</p>
+      </div>
+      <div class="caps3d-footer">
+        <p id="caps3d-details" class="muted" role="status">Drag to orbit, scroll to zoom.</p>
+        <div id="caps3d-legend" class="caps3d-legend" aria-label="Detected cap colours and heights"></div>
+      </div>
+    </section>
     <div id="announcer" class="sr-only" aria-live="polite"></div>
   </main>
 </body>

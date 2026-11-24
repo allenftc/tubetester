@@ -41,6 +41,21 @@ class WorkflowRuntime:
     def debug_pickup_active(self) -> bool:
         return self._controller.debug_pickup_active
 
+    @property
+    def busy(self) -> bool:
+        return self._controller.busy
+
+    @property
+    def poll_interval_seconds(self) -> float:
+        return self._controller.poll_interval_seconds
+
+    @property
+    def moonraker(self) -> MoonrakerClient:
+        return self._controller.moonraker
+
+    async def apply_settings(self, settings: ControllerSettings) -> None:
+        await self._controller.apply_settings(settings)
+
     async def initialize(self) -> None:
         await self._controller.initialize()
 

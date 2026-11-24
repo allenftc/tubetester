@@ -25,6 +25,10 @@ class MoonrakerClient:
     def get_printer_info(self) -> MoonrakerResponse:
         return self._request("GET", "/printer/info")
 
+    def get_toolhead_position(self) -> MoonrakerResponse:
+        """Query the live toolhead position, which /printer/info does not include."""
+        return self._request("GET", "/printer/objects/query?toolhead=position")
+
     def send_gcode(self, script: str) -> MoonrakerResponse:
         return self._request("POST", "/printer/gcode/script", json_body={"script": script})
 

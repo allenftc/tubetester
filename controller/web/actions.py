@@ -7,9 +7,9 @@ from typing import Any
 
 from controller.network.moonraker import MoonrakerResponse
 from controller.vision.camera_preview import CameraPreviewService
+from controller.vision.tubeLocator.cap_matching import LocatedCap, assign_caps_to_slots, locate_caps, select_cap
 from controller.vision.tubeLocator.tube_locator import (
     STEREO_BASELINE_MM,
-    pixel_to_real,
     triangulate_stereo_circles,
 )
 from controller.web.events import utc_timestamp
@@ -302,10 +302,10 @@ class CameraPickupActions:
             camera_y = tube.y - offset.y
             target = {"x": None, "y": None}
             steps = [
-                {"label": f"Move camera to scan Z={scan_height:.2f} mm", "command": self.motion.synchronized_move_command(x=camera_x, y=camera_y, z=scan_height, feedrate=10000), "state": "pending"},
-                {"label": "Find tube and record its color from the sampling ring", "command": "WAITING_FOR_DETECTION", "state": "pending"},
-                {"label": "Move to the configured color-specific pickup height", "command": "WAITING_FOR_COLOR_HEIGHT", "state": "pending"},
-                {"label": "Calculate matrix world offset and move gantry", "command": "WAITING_FOR_WORLD_OFFSET", "state": "pending"},
+                {"label": f"Move camera to survey Z={scan_height:.2f} mm above the slot", "command": self.motion.synchronized_move_command(x=camera_x, y=camera_y, z=scan_height, feedrate=10000), "state": "pending"},
+                {"label": "Detect every cap and match the one in this slot", "command": "WAITING_FOR_DETECTION", "state": "pending"},
+                {"label": "Center camera over the matched cap at its close-up height", "command": "WAITING_FOR_CLOSEUP", "state": "pending"},
+                {"label": "Re-detect the cap close up and move the gantry over it", "command": "WAITING_FOR_WORLD_OFFSET", "state": "pending"},
                 {"label": "Turn vacuum pump on", "command": self.motion.pickup_command(), "state": "pending"},
                 {"label": "Move down to the color-specific pickup height", "command": "WAITING_FOR_PICKUP_HEIGHT", "state": "pending"},
                 {"label": f"Raise to Z={post_pickup_height:.2f} mm", "command": self.motion.synchronized_move_command(z=post_pickup_height, feedrate=5000), "state": "pending"},
@@ -331,6 +331,9 @@ class CameraPickupActions:
                 "calibrated_scan_height_mm": None,
                 "detected_color": None,
                 "world_offset_mm": None,
+                "survey_xy": None,
+                "survey_caps": [],
+                "matched_cap": None,
                 "scan_height_mm": scan_height,
                 "safe_z_mm": safe_z,
                 "current_z": None,
@@ -359,58 +362,68 @@ class CameraPickupActions:
             try:
                 if index == 1:
                     step["state"] = "running"
-                    detection = await asyncio.to_thread(
-                        camera_preview.wait_for_hough_detection,
-                        session["detection_sequence"],
-                        10,
-                        8.0,
-                        True,
-                        3,
+                    match, caps = await self._locate_cap_near(
+                        camera_preview,
+                        session,
+                        (session["tube_xy"]["x"], session["tube_xy"]["y"]),
+                        "survey",
                     )
-                    if detection is None:
-                        raise RuntimeUnavailable("No tube center detected at scan height; no pickup was made.")
-                    center = detection["detected_center"]
-                    color = detection.get("detected_color")
-                    if not color:
-                        raise RuntimeUnavailable("Tube detected but no color was classified; no pickup was made.")
-                    session["detected_center_px"] = center
+                    color = match.color
+                    distance = match.distance_to(session["tube_xy"]["x"], session["tube_xy"]["y"])
+                    session["detected_center_px"] = list(match.pixel)
                     session["detected_color"] = color
+                    session["matched_cap"] = match.as_dict()
+                    session["survey_xy"] = {"x": match.x_mm, "y": match.y_mm}
                     await self._record_tube_color(session["row"], session["column"], color)
                     session["calibrated_scan_height_mm"] = (
                         self.settings.rack.calibrated_scan_height_for_color(color)
                     )
                     session["pickup_height_mm"] = self.settings.rack.pickup_height_for_color(color)
-                    step["label"] = f"Detected {color} tube at px=({center[0]:.1f}, {center[1]:.1f})"
+                    step["label"] = (
+                        f"Matched {color} cap at X={match.x_mm:.2f} Y={match.y_mm:.2f} mm, "
+                        f"{distance:.1f} mm from the slot center ({len(caps)} cap(s) in view)"
+                    )
                 elif index == 2:
-                    pickup_height = session["calibrated_scan_height_mm"]
-                    if pickup_height is None or not math.isfinite(pickup_height):
-                        raise RuntimeUnavailable("Color-specific calibration scan height must be finite.")
-                    step["command"] = self.motion.synchronized_move_command(z=pickup_height, feedrate=3000)
-                    step["label"] = f"Move to {session['detected_color']} offset scan Z={pickup_height:.2f} mm"
+                    closeup_z = session["calibrated_scan_height_mm"]
+                    if closeup_z is None or not math.isfinite(closeup_z):
+                        raise RuntimeUnavailable("Color-specific close-up height must be finite.")
+                    offset = self.settings.rack.camera_offset_mm
+                    camera_x = session["survey_xy"]["x"] - offset.x
+                    camera_y = session["survey_xy"]["y"] - offset.y
+                    move_xy = self.motion.synchronized_move_command(x=camera_x, y=camera_y, feedrate=5000)
+                    move_z = self.motion.synchronized_move_command(z=closeup_z, feedrate=3000)
+                    # Climb before travelling, travel before descending.
+                    current_z = session["current_z"]
+                    rising = current_z is None or closeup_z > current_z
+                    step["command"] = "\n".join((move_z, move_xy) if rising else (move_xy, move_z))
+                    step["label"] = (
+                        f"Center camera over the {session['detected_color']} cap at "
+                        f"close-up Z={closeup_z:.2f} mm"
+                    )
                     await self._send_macro_gcode(step["command"], correlation_id)
+                    session["camera_xy"] = {"x": camera_x, "y": camera_y}
+                    session["current_z"] = closeup_z
+                    session["detection_sequence"] = camera_preview.status()["sequence"]
                 elif index == 3:
                     step["state"] = "running"
-                    detection = await asyncio.to_thread(
-                        camera_preview.wait_for_hough_detection,
-                        session["detection_sequence"],
-                        10,
-                        8.0,
+                    match, _ = await self._locate_cap_near(
+                        camera_preview,
+                        session,
+                        (session["survey_xy"]["x"], session["survey_xy"]["y"]),
+                        "close-up",
+                        prefer_color=session["detected_color"],
                     )
-                    if detection is None:
-                        raise RuntimeUnavailable("No tube center detected at the color-adjusted calibration height.")
-                    center = detection["detected_center"]
-                    session["detected_center_px"] = center
-                    matrix_x, matrix_y = pixel_to_real(float(center[0]), float(center[1]))
-                    target_x = session["camera_xy"]["x"] + matrix_x
-                    target_y = session["camera_xy"]["y"] + matrix_y
+                    session["detected_center_px"] = list(match.pixel)
+                    session["matched_cap"] = match.as_dict()
+                    target_x, target_y = match.x_mm, match.y_mm
                     offset_x = target_x - session["tube_xy"]["x"]
                     offset_y = target_y - session["tube_xy"]["y"]
                     session["target_xy"] = {"x": target_x, "y": target_y}
                     session["world_offset_mm"] = {"x": offset_x, "y": offset_y}
                     step["command"] = self.motion.synchronized_move_command(x=target_x, y=target_y, feedrate=5000)
                     step["label"] = (
-                        f"Move gantry to corrected X={target_x:.2f} Y={target_y:.2f} mm "
-                        f"(matrix offset {matrix_x:.2f}, {matrix_y:.2f})"
+                        f"Move gantry to cap X={target_x:.2f} Y={target_y:.2f} mm "
+                        f"(slot offset {offset_x:+.2f}, {offset_y:+.2f})"
                     )
                     await self._send_macro_gcode(step["command"], correlation_id)
                 elif index == 5:
@@ -432,9 +445,6 @@ class CameraPickupActions:
                     await self._send_macro_gcode(command, correlation_id)
                     if index == 0:
                         session["current_z"] = session["scan_height_mm"]
-                        session["detection_sequence"] = camera_preview.status()["sequence"]
-                    elif index == 2:
-                        session["current_z"] = session["calibrated_scan_height_mm"]
                         session["detection_sequence"] = camera_preview.status()["sequence"]
                     elif index == 4:
                         session["vacuum_enabled"] = True
@@ -484,6 +494,66 @@ class CameraPickupActions:
             self._broadcast_status()
             return self._debug_pickup_payload()
 
+    async def _locate_cap_near(
+        self,
+        camera_preview: CameraPreviewService,
+        session: dict[str, Any],
+        target_xy: tuple[float, float],
+        phase: str,
+        prefer_color: str | None = None,
+    ) -> tuple[LocatedCap, list[LocatedCap]]:
+        """Detect all caps in view, place them in gantry XY, and pick the one nearest ``target_xy``."""
+        result = await asyncio.to_thread(
+            camera_preview.wait_for_circle_detections,
+            session["detection_sequence"],
+            10,
+            8.0,
+        )
+        if result is None:
+            raise RuntimeUnavailable(f"Camera did not provide {phase} frames; no pickup was made.")
+        caps = locate_caps(
+            result["circles"],
+            (session["camera_xy"]["x"], session["camera_xy"]["y"]),
+            session["current_z"],
+            self.settings.rack.cap_height_for_color,
+        )
+        if phase == "survey":
+            session["survey_caps"] = [cap.as_dict() for cap in caps]
+        tolerance = self.settings.rack.slot_tolerance_mm
+        match = None
+        if phase == "survey":
+            # Every rack slot competes for the caps in view, so a leaning
+            # neighbour cannot be mistaken for this slot's tube.
+            rack = self.settings.rack
+            slots = {
+                (row, column): (position.x, position.y)
+                for row in range(rack.rows)
+                for column in range(rack.columns)
+                for position in (rack.tube_position(row, column),)
+            }
+            match = assign_caps_to_slots(caps, slots, tolerance).get(
+                (session["row"] - 1, session["column"] - 1)
+            )
+            if match is None:
+                nearest = min((cap.distance_to(*target_xy) for cap in caps), default=math.inf)
+                raise RuntimeUnavailable(
+                    f"No cap could be assigned to row {session['row']}, column {session['column']} "
+                    f"({len(caps)} circle(s) seen, {sum(cap.x_mm is not None for cap in caps)} with a known color; "
+                    f"nearest placed cap {nearest:.1f} mm away, limit {tolerance:.1f} mm); no pickup was made."
+                )
+            return match, caps
+        if prefer_color:
+            match = select_cap([cap for cap in caps if cap.color == prefer_color], target_xy, tolerance)
+        if match is None:
+            match = select_cap(caps, target_xy, tolerance)
+        if match is None:
+            placed = sum(cap.x_mm is not None for cap in caps)
+            raise RuntimeUnavailable(
+                f"No cap within {tolerance:.1f} mm of X={target_xy[0]:.2f} Y={target_xy[1]:.2f} at {phase} height "
+                f"({len(caps)} circle(s) seen, {placed} with a known color); no pickup was made."
+            )
+        return match, caps
+
     def _require_debug_pickup(self, session_id: str) -> dict[str, Any]:
         session = self._debug_pickup
         if not session or session["id"] != session_id:
@@ -509,6 +579,9 @@ class CameraPickupActions:
             "detected_center_px": session["detected_center_px"],
             "detected_color": session["detected_color"],
             "world_offset_mm": dict(session["world_offset_mm"]) if session["world_offset_mm"] else None,
+            "survey_xy": dict(session["survey_xy"]) if session["survey_xy"] else None,
+            "survey_caps": [dict(cap) for cap in session["survey_caps"]],
+            "matched_cap": dict(session["matched_cap"]) if session["matched_cap"] else None,
             "stereo_position_mm": dict(session["stereo_position_mm"]) if session["stereo_position_mm"] else None,
             "correction_mm": dict(session["correction_mm"]) if session["correction_mm"] else None,
             "pickup_height_mm": session["pickup_height_mm"],

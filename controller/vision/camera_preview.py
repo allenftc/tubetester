@@ -11,7 +11,8 @@ import cv2
 import numpy as np
 
 from controller.config.settings import CameraSettings
-from controller.vision.tubeLocator.tube_locator import HOUGH_GRADIENT, TubeLocator
+from controller.vision.tubeLocator.cap_matching import MergedCircle, merge_frame_detections
+from controller.vision.tubeLocator.tube_locator import HOUGH_GRADIENT, CapCircle, TubeLocator
 
 
 PREVIEW_WIDTH = 640
@@ -31,6 +32,8 @@ class CameraPreviewService:
         self._stop_event = threading.Event()
         self._thread: threading.Thread | None = None
         self._capture: cv2.VideoCapture | None = None
+        self._locator_generation = 0
+        self._reopen_requested = False
         self._photo_lock = threading.Lock()
         self._photo_requested = False
         self._photo_directory = PHOTO_DIRECTORY
@@ -59,6 +62,7 @@ class CameraPreviewService:
             "detected_offset_roi": None,
             "tube_present": False,
             "detected_color": None,
+            "detected_circles": [],
             "detection_mode": self._detection_mode,
             "circle_min_distance": self._circle_min_distance,
             "circle_edge_threshold": self._circle_edge_threshold,
@@ -110,6 +114,21 @@ class CameraPreviewService:
             else:
                 self._set_status(available=False, state="stopping", message="Stopping camera preview.")
 
+    def apply_settings(self, settings: CameraSettings) -> None:
+        """Swap camera settings and refresh the capture thread in place."""
+        with self._condition:
+            previous = self.settings
+            self.settings = settings
+            self._locator_generation += 1
+            if (
+                previous.device_index != settings.device_index
+                or previous.resolution != settings.resolution
+            ):
+                self._reopen_requested = True
+            self._status["device"] = self._device_name()
+            self._status["roi"] = self._configured_roi()
+            self._condition.notify_all()
+
     def set_color_range_recording(self, recording: bool) -> None:
         with self._condition:
             self._record_color_range = recording
@@ -136,6 +155,7 @@ class CameraPreviewService:
                 "detected_offset_roi": list(self._status["detected_offset_roi"])
                 if self._status["detected_offset_roi"] is not None
                 else None,
+                "detected_circles": [dict(c) for c in self._status.get("detected_circles") or []],
             }
 
     def take_photo(self, *, timeout_seconds: float = 8.0, directory: Path | None = None) -> dict[str, Any]:
@@ -318,6 +338,50 @@ class CameraPreviewService:
                 "sequence": sequence,
             }
 
+    def wait_for_circle_detections(
+        self,
+        after_sequence: int,
+        frame_count: int = 10,
+        timeout_seconds: float = 8.0,
+    ) -> dict[str, Any] | None:
+        """Collect whole-frame circles from ``frame_count`` fresh frames and merge them.
+
+        Returns ``None`` if the camera stops or times out before enough frames
+        arrive. ``circles`` holds caps seen in at least half the frames.
+        """
+        if frame_count <= 0:
+            raise ValueError("frame_count must be greater than zero")
+        deadline = time.monotonic() + timeout_seconds
+        frames: list[list[CapCircle]] = []
+        sequence = after_sequence
+        with self._condition:
+            while len(frames) < frame_count:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0 or self._status["state"] in {"unavailable", "error", "stopped"}:
+                    return None
+                self._condition.wait_for(
+                    lambda: self._sequence > sequence
+                    or self._status["state"] in {"unavailable", "error", "stopped"}
+                    or self._stop_event.is_set(),
+                    timeout=remaining,
+                )
+                if self._sequence <= sequence:
+                    return None
+                sequence = self._sequence
+                frames.append([
+                    CapCircle(x=c["x"], y=c["y"], radius=c["radius"], color=c["color"])
+                    for c in self._status.get("detected_circles") or []
+                ])
+            width, height = self._status["width"], self._status["height"]
+        merged: list[MergedCircle] = merge_frame_detections(frames)
+        return {
+            "circles": merged,
+            "frame_count": len(frames),
+            "width": width,
+            "height": height,
+            "sequence": sequence,
+        }
+
     def _update_color_range(self, sample: dict[str, float | int] | None) -> None:
         if sample is None:
             return
@@ -354,6 +418,7 @@ class CameraPreviewService:
 
     def _capture_loop(self) -> None:
         locator = TubeLocator(show_preview=False, roi_rotation_deg=self.settings.roi_rotation_deg)
+        locator_generation = self._locator_generation
         center_history: deque[tuple[int, int]] = deque(maxlen=9)
         radius_history: deque[int] = deque(maxlen=9)
         previous_detection_mode = "hough"
@@ -378,6 +443,23 @@ class CameraPreviewService:
                 radius_history.clear()
                 try:
                     while not self._stop_event.is_set():
+                        with self._condition:
+                            if self._reopen_requested:
+                                self._reopen_requested = False
+                                reopen = True
+                            else:
+                                reopen = False
+                                generation = self._locator_generation
+                        if reopen:
+                            break
+                        if generation != locator_generation:
+                            locator = TubeLocator(
+                                show_preview=False,
+                                roi_rotation_deg=self.settings.roi_rotation_deg,
+                            )
+                            locator_generation = generation
+                            center_history.clear()
+                            radius_history.clear()
                         frame_started = time.monotonic()
                         grabbed, frame = capture.read()
                         if not grabbed or frame is None:
@@ -400,46 +482,24 @@ class CameraPreviewService:
                             center_history.clear()
                             radius_history.clear()
                             previous_detection_mode = detection_mode
-                        circles: list[tuple[int, int, int]] = []
                         debug_montage: np.ndarray | None = None
-                        raw_center: tuple[int, int] | None = None
+                        all_circles: list[CapCircle] = []
+                        detected_offset_roi = None
                         if detection_mode == "hough":
-                            center, tube_present, color, mask, circles, debug_montage = locator.locate_with_circles(frame, roi)
-                            raw_center = center
+                            # Whole frame, no ROI: every cap is reported and the
+                            # workflow decides which one belongs to the slot.
+                            all_circles, mask, debug_montage = locator.detect_all_circles(frame)
+                            nearest = min(
+                                all_circles,
+                                key=lambda c: (c.x - frame.shape[1] / 2) ** 2 + (c.y - frame.shape[0] / 2) ** 2,
+                                default=None,
+                            )
+                            center = None if nearest is None else (int(round(nearest.x)), int(round(nearest.y)))
+                            color = None if nearest is None else nearest.color
+                            tube_present = bool(all_circles)
                         else:
                             center, tube_present, color, mask = locator.locate_with_mask(frame, roi)
                         self._update_color_range(locator.last_color_stats)
-                        if detection_mode == "hough":
-                            if center is None:
-                                center_history.clear()
-                                radius_history.clear()
-                            else:
-                                center_history.append(center)
-                                center = (
-                                    int(round(float(np.median([point[0] for point in center_history])))),
-                                    int(round(float(np.median([point[1] for point in center_history])))),
-                                )
-                                if circles and raw_center is not None:
-                                    selected_index = min(
-                                        range(len(circles)),
-                                        key=lambda index: (
-                                            circles[index][0] - raw_center[0]
-                                        ) ** 2 + (
-                                            circles[index][1] - raw_center[1]
-                                        ) ** 2,
-                                    )
-                                    selected_circle = circles[selected_index]
-                                    radius_history.append(selected_circle[2])
-                                    circles[selected_index] = (
-                                        center[0],
-                                        center[1],
-                                        int(round(float(np.median(radius_history)))),
-                                    )
-                        detected_offset_roi = (
-                            locator.roi_offset_from_frame_point(center, roi)
-                            if detection_mode == "hough" and center is not None
-                            else None
-                        )
                         if mask is None:
                             self._set_status(
                                 available=False,
@@ -447,15 +507,17 @@ class CameraPreviewService:
                                 message="The locator could not produce an HSV mask for the camera frame.",
                             )
                             break
-                        preview = locator.annotate(
-                            frame,
-                            roi,
-                            center,
-                            tube_present,
-                            circles,
-                            color=color,
-                            color_radius=locator.last_color_radius,
-                        )
+                        if detection_mode == "hough":
+                            preview = locator.annotate_circles(frame, all_circles, center)
+                        else:
+                            preview = locator.annotate(
+                                frame,
+                                roi,
+                                center,
+                                tube_present,
+                                color=color,
+                                color_radius=locator.last_color_radius,
+                            )
                         encoded, image = cv2.imencode(
                             ".jpg",
                             preview,
@@ -499,6 +561,10 @@ class CameraPreviewService:
                                 detected_center=center,
                                 detected_color=color,
                                 detected_offset_roi=detected_offset_roi,
+                                detected_circles=[
+                                    {"x": c.x, "y": c.y, "radius": c.radius, "color": c.color}
+                                    for c in all_circles
+                                ],
                                 tube_present=tube_present,
                                 sequence=self._sequence,
                             )

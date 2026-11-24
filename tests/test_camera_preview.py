@@ -227,7 +227,9 @@ class CameraPreviewTests(unittest.TestCase):
         self.assertGreaterEqual(mask_sequence, sequence)
         self.assertIsNotNone(mask_jpeg)
         decoded_mask = cv2.imdecode(np.frombuffer(mask_jpeg, dtype=np.uint8), cv2.IMREAD_GRAYSCALE)
-        self.assertEqual(decoded_mask.shape, (status["roi"]["height"], status["roi"]["width"]))
+        # Hough mode detects across the whole frame, so its mask is full-frame.
+        self.assertEqual(decoded_mask.shape, (PREVIEW_HEIGHT, PREVIEW_WIDTH))
+        self.assertEqual(status["detected_circles"], [])
         self.assertEqual(status["roi"], {
             "center_x": round(settings.roi_center_x * PREVIEW_WIDTH / settings.resolution.width),
             "center_y": round(settings.roi_center_y * PREVIEW_HEIGHT / settings.resolution.height),

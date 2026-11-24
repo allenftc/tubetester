@@ -65,14 +65,130 @@ pixel_to_world = np.array(
 )
 
 
-def pixel_to_real(pixel_x: float, pixel_y: float) -> tuple[float, float]:
-    pixel = np.array(
-        [[[pixel_x, pixel_y]]],
-        dtype=np.float64,
+# Gantry Z at which grid_mapping.json was captured; pixel_to_real's
+# camera_raise_mm is measured from here.
+CALIBRATION_GANTRY_Z_MM = float(calibration.get("gantry_z_mm", 50.0))
+# Whole-frame cap radius limits (pixels). Caps get bigger as the camera
+# descends, so these cover both the survey and the close-up height.
+FULL_FRAME_MIN_RADIUS_PX = 12
+FULL_FRAME_MAX_RADIUS_PX = 90
+
+
+@dataclass(frozen=True)
+class CapCircle:
+    """One cap circle found in a whole frame, in frame pixels."""
+
+    x: float
+    y: float
+    radius: float
+    color: Optional[str]
+
+
+world_to_pixel = np.linalg.inv(pixel_to_world)
+world_to_pixel /= world_to_pixel[2, 2]
+INTRINSICS_PATH = Path(__file__).resolve().with_name("camera_calibration.npz")
+
+
+@dataclass(frozen=True)
+class RackCameraPose:
+    """Camera pose recovered from the rack homography plus lens intrinsics.
+
+    ``height_column`` is what one millimetre of height above the rack adds to
+    the third column of ``world_to_pixel``; ``camera_height_mm`` is the camera's
+    distance above the rack top at the gantry Z used for grid_mapping.json.
+    """
+
+    height_column: np.ndarray
+    camera_height_mm: float
+    camera_xy_mm: tuple[float, float]
+    tilt_deg: float
+    axis_scale_ratio: float
+
+
+def _decompose_rack_pose(homography: np.ndarray, camera_matrix: np.ndarray) -> RackCameraPose:
+    """Split a world(mm)->pixel plane homography into K[r1 r2 t] and return the pose."""
+    columns = np.linalg.inv(camera_matrix) @ homography
+    norm_1 = float(np.linalg.norm(columns[:, 0]))
+    norm_2 = float(np.linalg.norm(columns[:, 1]))
+    scale = 2.0 / (norm_1 + norm_2)
+    if columns[2, 2] * scale < 0:
+        scale = -scale  # The rack must be in front of the camera.
+    r1, r2, translation = (columns * scale).T
+    # Snap r1/r2 to the nearest true rotation before taking the normal.
+    u, _, vt = np.linalg.svd(np.column_stack((r1, r2, np.cross(r1, r2))))
+    rotation = u @ vt
+    camera_center = -rotation.T @ translation
+    # +Z points from the rack toward the camera.
+    up = rotation[:, 2] if camera_center[2] > 0 else -rotation[:, 2]
+    return RackCameraPose(
+        height_column=(camera_matrix @ up) / scale,
+        camera_height_mm=float(abs(camera_center[2])),
+        camera_xy_mm=(float(camera_center[0]), float(camera_center[1])),
+        tilt_deg=float(np.degrees(np.arccos(min(1.0, abs(rotation[2, 2]))))),
+        axis_scale_ratio=norm_1 / norm_2,
     )
 
-    real = cv2.perspectiveTransform(pixel, pixel_to_world)[0, 0]
+
+_rack_pose: Optional[RackCameraPose] = None
+
+
+def rack_camera_pose() -> RackCameraPose:
+    """Load (once) the camera pose implied by grid_mapping.json and the intrinsics."""
+    global _rack_pose
+    if _rack_pose is None:
+        with np.load(INTRINSICS_PATH) as intrinsics:
+            camera_matrix = np.asarray(intrinsics["camera_matrix"], dtype=np.float64)
+        _rack_pose = _decompose_rack_pose(world_to_pixel, camera_matrix)
+    return _rack_pose
+
+
+def _world_to_pixel_at(height_mm: float) -> np.ndarray:
+    """Homography for the horizontal plane ``height_mm`` above the rack top."""
+    if height_mm == 0.0:
+        return world_to_pixel
+    if not np.isfinite(height_mm):
+        raise ValueError("height_mm must be finite")
+    pose = rack_camera_pose()
+    if height_mm >= pose.camera_height_mm:
+        raise ValueError(
+            f"height_mm={height_mm:.1f} is at or above the camera "
+            f"({pose.camera_height_mm:.1f} mm above the rack)"
+        )
+    matrix = world_to_pixel.copy()
+    matrix[:, 2] += height_mm * pose.height_column
+    return matrix
+
+
+def pixel_to_real(
+    pixel_x: float,
+    pixel_y: float,
+    height_mm: float = 0.0,
+    camera_raise_mm: float = 0.0,
+) -> tuple[float, float]:
+    """Map an image pixel to rack-frame XY in mm.
+
+    ``height_mm`` is how far the imaged point (e.g. a cap top) sits above the
+    rack top. ``camera_raise_mm`` is how far the gantry Z is above the Z used
+    when grid_mapping.json was calibrated. With both at 0 this is the plain
+    rack-plane homography.
+    """
+    matrix = np.linalg.inv(_world_to_pixel_at(height_mm - camera_raise_mm))
+    pixel = np.array([[[pixel_x, pixel_y]]], dtype=np.float64)
+    real = cv2.perspectiveTransform(pixel, matrix)[0, 0]
     return float(real[0]), float(real[1])
+
+
+def real_to_pixel(
+    real_x: float,
+    real_y: float,
+    height_mm: float = 0.0,
+    camera_raise_mm: float = 0.0,
+) -> tuple[float, float]:
+    """Inverse of :func:`pixel_to_real`: where a rack-frame point appears in the image."""
+    matrix = _world_to_pixel_at(height_mm - camera_raise_mm)
+    point = np.array([[[real_x, real_y]]], dtype=np.float64)
+    pixel = cv2.perspectiveTransform(point, matrix)[0, 0]
+    return float(pixel[0]), float(pixel[1])
 
 
 def triangulate_stereo_circles(
@@ -530,6 +646,158 @@ class TubeLocator:
 			color = self._classify_color(roi_image, (roi_circle[0], roi_circle[1]), radius=roi_circle[2])
 		debug_montage = self._circle_debug_montage(roi_image, gray, hough_input, roi_circles)
 		return center, bool(circles), color, raw_mask, circles, debug_montage
+
+	def detect_all_circles(
+		self,
+		frame: np.ndarray,
+		min_radius: int = FULL_FRAME_MIN_RADIUS_PX,
+		max_radius: int = FULL_FRAME_MAX_RADIUS_PX,
+	) -> tuple[list[CapCircle], Optional[np.ndarray], Optional[np.ndarray]]:
+		"""Detect every cap circle in the whole frame (no ROI) and classify each one's color.
+
+		Returns the circles, the raw HSV threshold mask, and a debug montage.
+		``last_color_stats``/``last_color_radius`` describe the circle nearest the
+		frame center so color-range recording keeps working.
+		"""
+		self.last_color_stats = None
+		self.last_color_radius = None
+		if frame is None or frame.size == 0:
+			return [], None, None
+		height, width = frame.shape[:2]
+		hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
+		raw_mask = cv2.inRange(hsv, self.lower_hsv, self.upper_hsv)
+		mask = cv2.bitwise_not(raw_mask) if self.invert_mask else raw_mask.copy()
+		kernel = np.ones((3, 3), np.uint8)
+		mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel)
+		mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel)
+		gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+		blurred = cv2.GaussianBlur(cv2.medianBlur(gray, 5), (9, 9), 1)
+		hough_input = cv2.bitwise_and(blurred, blurred, mask=mask)
+		alt = self.circle_method == HOUGH_GRADIENT_ALT
+		detected = cv2.HoughCircles(
+			hough_input,
+			cv2.HOUGH_GRADIENT_ALT if alt else cv2.HOUGH_GRADIENT,
+			dp=1.5 if alt else 1,
+			minDist=self.circle_min_distance,
+			param1=self.circle_canny_threshold,
+			param2=0.90 if alt else self.circle_edge_threshold,
+			minRadius=min_radius,
+			maxRadius=max_radius,
+		)
+		raw_circles: list[Circle] = []
+		if detected is not None:
+			raw_circles = self._suppress_inner_circles([
+				tuple(int(value) for value in circle)
+				for circle in np.rint(detected[0]).astype(int)
+			])
+		edges = cv2.Canny(hough_input, self.circle_canny_threshold / 2, self.circle_canny_threshold)
+		circles = []
+		for x, y, radius in raw_circles:
+			fx, fy, fr = self._refine_circle(edges, x, y, radius)
+			circles.append(CapCircle(
+				x=fx,
+				y=fy,
+				radius=fr,
+				color=self._classify_color(frame, (x, y), radius=radius, samples_mask=mask),
+			))
+		if raw_circles:
+			nearest = min(raw_circles, key=lambda c: (c[0] - width / 2) ** 2 + (c[1] - height / 2) ** 2)
+			self._classify_color(frame, nearest[:2], radius=nearest[2], samples_mask=mask)
+			self.last_color_radius = nearest[2]
+		scale = 0.25
+		small = lambda image: cv2.resize(image, None, fx=scale, fy=scale, interpolation=cv2.INTER_AREA)
+		debug_montage = self._circle_debug_montage(
+			small(frame),
+			small(gray),
+			small(hough_input),
+			[(int(x * scale), int(y * scale), max(1, int(r * scale))) for x, y, r in raw_circles],
+		)
+		return circles, raw_mask, debug_montage
+
+	@staticmethod
+	def _refine_circle(edges: np.ndarray, x: int, y: int, radius: int) -> tuple[float, float, float]:
+		"""Least-squares circle fit to rim edge pixels near a Hough detection.
+
+		Hough centers are quantised by the accumulator; fitting the edge pixels in
+		an annulus around the detected rim recovers sub-pixel centers. Points from
+		touching neighbours are rejected as outliers; if the fit drifts, the Hough
+		circle is kept.
+		"""
+		height, width = edges.shape[:2]
+		pad = int(radius * 1.3) + 2
+		x0, x1 = max(0, x - pad), min(width, x + pad + 1)
+		y0, y1 = max(0, y - pad), min(height, y + pad + 1)
+		ys, xs = np.nonzero(edges[y0:y1, x0:x1])
+		xs = xs.astype(np.float64) + x0
+		ys = ys.astype(np.float64) + y0
+		distance = np.hypot(xs - x, ys - y)
+		keep = (distance > radius * 0.75) & (distance < radius * 1.25)
+		xs, ys = xs[keep], ys[keep]
+		fallback = (float(x), float(y), float(radius))
+		for _ in range(3):
+			if len(xs) < 12:
+				return fallback
+			matrix = np.column_stack((xs, ys, np.ones_like(xs)))
+			rhs = xs * xs + ys * ys
+			(a, b, c), *_ = np.linalg.lstsq(matrix, rhs, rcond=None)
+			cx, cy = a / 2.0, b / 2.0
+			fit_radius = float(np.sqrt(max(c + cx * cx + cy * cy, 0.0)))
+			residual = np.abs(np.hypot(xs - cx, ys - cy) - fit_radius)
+			inliers = residual < 2.0
+			if inliers.all():
+				break
+			xs, ys = xs[inliers], ys[inliers]
+		if (
+			not 0.8 * radius <= fit_radius <= 1.2 * radius
+			or np.hypot(cx - x, cy - y) > 0.3 * radius
+		):
+			return fallback
+		return float(cx), float(cy), fit_radius
+
+	def annotate_circles(
+		self,
+		frame: np.ndarray,
+		circles: list[CapCircle],
+		highlight: Optional[Point] = None,
+	) -> np.ndarray:
+		"""Draw every detected cap with its color label; mark ``highlight`` in red."""
+		preview = frame.copy()
+		for circle in circles:
+			center = (int(round(circle.x)), int(round(circle.y)))
+			cv2.circle(preview, center, int(round(circle.radius)), (0, 255, 0), 2)
+			cv2.circle(preview, center, 2, (0, 255, 0), -1)
+			cv2.putText(
+				preview,
+				circle.color or "?",
+				(center[0] + 6, center[1] - 6),
+				cv2.FONT_HERSHEY_SIMPLEX,
+				0.45,
+				(0, 0, 0),
+				3,
+				cv2.LINE_AA,
+			)
+			cv2.putText(
+				preview,
+				circle.color or "?",
+				(center[0] + 6, center[1] - 6),
+				cv2.FONT_HERSHEY_SIMPLEX,
+				0.45,
+				(255, 255, 255),
+				1,
+				cv2.LINE_AA,
+			)
+		if highlight is not None:
+			cv2.drawMarker(preview, highlight, (0, 0, 255), cv2.MARKER_CROSS, 20, 2)
+		cv2.putText(
+			preview,
+			f"{len(circles)} cap(s) detected",
+			(10, 25),
+			cv2.FONT_HERSHEY_SIMPLEX,
+			0.7,
+			(0, 255, 0) if circles else (0, 0, 255),
+			2,
+		)
+		return preview
 
 	@staticmethod
 	def _circle_from_mask(

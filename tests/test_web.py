@@ -12,7 +12,11 @@ from controller.config.settings import load_settings
 from controller.network.moonraker import MoonrakerResponse
 from controller.web.runtime import RuntimeConflict, RuntimeUnavailable, WorkflowRuntime
 from controller.web.server import create_control_app
-from controller.vision.tubeLocator.tube_locator import triangulate_stereo_circles
+from controller.vision.tubeLocator.tube_locator import (
+    CALIBRATION_GANTRY_Z_MM,
+    real_to_pixel,
+    triangulate_stereo_circles,
+)
 
 
 class FakeMoonraker:
@@ -777,6 +781,115 @@ class RuntimeTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("SET_PIN PIN=solenoid VALUE=1\nG4 P500\nSET_PIN PIN=solenoid VALUE=0\nSET_PIN PIN=vacuum_pump VALUE=0", moonraker.commands[4])
         self.assertEqual(moonraker.commands[5], "SET_PIN PIN=solenoid VALUE=0\nSET_PIN PIN=vacuum_pump VALUE=0")
         await runtime.close()
+
+
+class PositionedFakeMoonraker(FakeMoonraker):
+    """Ready Moonraker that also reports a toolhead position."""
+
+    def __init__(self, position: tuple[float, float, float]) -> None:
+        super().__init__(ready=True)
+        self.position = position
+
+    def get_toolhead_position(self) -> MoonrakerResponse:
+        return MoonrakerResponse(
+            True,
+            200,
+            payload={"result": {"status": {"toolhead": {"position": [*self.position, 0.0]}}}},
+        )
+
+
+class CircleFakeCameraPreview(FakeCameraPreview):
+    """Streaming camera fake that exposes whole-frame cap detections."""
+
+    def __init__(self, circles: list[dict[str, object]], width: int = 640, height: int = 480) -> None:
+        super().__init__()
+        self.circles = circles
+        self.width = width
+        self.height = height
+        self.started = True
+
+    def status(self) -> dict[str, object]:
+        status = super().status()
+        status.update(
+            available=True,
+            state="streaming",
+            width=self.width,
+            height=self.height,
+            detected_circles=[dict(circle) for circle in self.circles],
+        )
+        return status
+
+
+class CapsEndpointTests(unittest.IsolatedAsyncioTestCase):
+    async def _client(self, preview: FakeCameraPreview, moonraker: FakeMoonraker) -> tuple[TestClient, WorkflowRuntime]:
+        settings = load_settings(Path(__file__).resolve().parents[1] / "calibration")
+        runtime = WorkflowRuntime(settings, moonraker=moonraker)
+        await runtime.refresh_machine()
+        client = TestClient(TestServer(create_control_app(
+            settings,
+            runtime=runtime,
+            camera_preview=preview,
+            initialize_hardware=False,
+        )))
+        await client.start_server()
+        return client, runtime
+
+    async def test_caps_are_placed_in_rack_frame_with_colour_heights(self) -> None:
+        settings = load_settings(Path(__file__).resolve().parents[1] / "calibration")
+        gantry = (100.0, 50.0, 75.0)
+        # Red leans toward its neighbour's slot; white sits on that neighbour.
+        # The one-to-one matcher must still give each cap its own slot.
+        red = (151.6, 51.6)
+        white = (159.8, 51.6)
+        red_height = settings.rack.cap_height_for_color("red")
+        white_height = settings.rack.cap_height_for_color("white")
+        circles = []
+        for cap, height, color in ((red, red_height, "red"), (white, white_height, "white")):
+            pixel = real_to_pixel(
+                cap[0] - gantry[0],
+                cap[1] - gantry[1],
+                height_mm=height,
+                camera_raise_mm=gantry[2] - CALIBRATION_GANTRY_Z_MM,
+            )
+            circles.append({"x": pixel[0], "y": pixel[1], "radius": 30.0, "color": color})
+        circles.append({"x": 80.0, "y": 60.0, "radius": 18.0, "color": None})
+        preview = CircleFakeCameraPreview(circles)
+        client, runtime = await self._client(preview, PositionedFakeMoonraker(gantry))
+        try:
+            payload = await (await client.get("/api/camera/caps")).json()
+        finally:
+            await client.close()
+            await runtime.close()
+
+        self.assertTrue(payload["machine"]["known"])
+        self.assertEqual(payload["placed_count"], 2)
+        self.assertEqual(payload["unplaced_count"], 1)
+        by_color = {cap["color"]: cap for cap in payload["caps"] if cap["placed"]}
+        self.assertAlmostEqual(by_color["red"]["x_mm"], red[0], places=6)
+        self.assertAlmostEqual(by_color["red"]["y_mm"], red[1], places=6)
+        self.assertAlmostEqual(by_color["red"]["cap_height_mm"], red_height, places=6)
+        # Red is geometrically closest to column 2, but that slot belongs to white.
+        self.assertEqual(by_color["red"]["slot"], {"row": 1, "column": 1})
+        self.assertEqual(by_color["white"]["slot"], {"row": 1, "column": 2})
+        self.assertAlmostEqual(payload["camera"]["raise_mm"], 25.0, places=6)
+        self.assertGreater(payload["camera"]["z"], payload["camera"]["height_mm"])
+
+    async def test_caps_without_a_position_are_reported_unplaced(self) -> None:
+        preview = CircleFakeCameraPreview([{"x": 320.0, "y": 240.0, "radius": 20.0, "color": "red"}])
+        client, runtime = await self._client(preview, FakeMoonraker(ready=True))
+        try:
+            payload = await (await client.get("/api/camera/caps")).json()
+            override = await (await client.get("/api/camera/caps?x=100&y=50&z=75")).json()
+        finally:
+            await client.close()
+            await runtime.close()
+
+        self.assertFalse(payload["machine"]["known"])
+        self.assertEqual(payload["placed_count"], 0)
+        self.assertIsNone(payload["camera"])
+        # Query parameters let the view work on a bench without Klipper.
+        self.assertTrue(override["machine"]["known"])
+        self.assertEqual(override["placed_count"], 1)
 
 
 if __name__ == "__main__":

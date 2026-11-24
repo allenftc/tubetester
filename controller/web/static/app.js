@@ -15,6 +15,20 @@ const state = {
   stereoTestBusy: false,
   cameraPickupSession: null,
   cameraPickupPreviewWasEnabled: true,
+  caps3d: {
+    data: null,
+    error: null,
+    target: null,
+    yaw: -2.35,
+    pitch: 0.92,
+    distance: 620,
+    dragging: false,
+    lastX: 0,
+    lastY: 0,
+    resetOnNextFrame: true,
+    pollTimer: null,
+    polling: false,
+  },
 };
 const el = id => document.getElementById(id);
 
@@ -30,6 +44,7 @@ async function api(path, body = {}) {
 
 async function bootstrap() {
   wireControls();
+  initCaps3d();
   try {
     const response = await fetch("/api/status", {cache: "no-store"});
     renderSnapshot(await response.json());
@@ -76,7 +91,10 @@ async function restorePickupCameraPreview() {
     const status = await response.json();
     state.cameraEnabled = !["not_started", "stopped"].includes(status.state);
     el("camera-preview-toggle").checked = state.cameraEnabled;
-    if (state.cameraEnabled) refreshCameraStatus();
+    if (state.cameraEnabled) {
+      refreshCameraStatus();
+      startCaps3dPolling();
+    }
   } catch (error) {
     setText("camera-details", error.message);
   }
@@ -90,6 +108,8 @@ async function setCameraPreviewEnabled(enabled) {
   if (!enabled) {
     state.cameraEnabled = false;
     window.clearTimeout(state.cameraPollTimer);
+    stopCaps3dPolling();
+    state.caps3d.data = null;
     image.removeAttribute("src");
     image.hidden = true;
     debug.removeAttribute("src");
@@ -99,14 +119,20 @@ async function setCameraPreviewEnabled(enabled) {
     state.cameraImageFailed = false;
     setChip("camera-chip", "PREVIEW OFF", "neutral");
     setText("camera-details", "Preview is off. Camera capture is stopped.");
+    renderCaps3d();
   }
   try {
     const result = await api("/api/camera/preview", {enabled});
     state.cameraEnabled = result.enabled;
-    if (enabled) {
+    if (result.enabled) {
       setChip("camera-chip", "CAMERA STARTING", "warning");
       setText("camera-details", `Opening ${result.camera.device}…`);
       refreshCameraStatus();
+      startCaps3dPolling();
+    } else {
+      stopCaps3dPolling();
+      state.caps3d.data = null;
+      renderCaps3d();
     }
   } catch (error) {
     toggle.checked = !enabled;
@@ -117,6 +143,7 @@ async function setCameraPreviewEnabled(enabled) {
     } else {
       state.cameraEnabled = true;
       refreshCameraStatus();
+      startCaps3dPolling();
     }
   } finally {
     toggle.disabled = state.cameraLocateBusy || ["running", "failed"].includes(state.cameraPickupSession?.state);
@@ -267,6 +294,7 @@ function renderSnapshot(snapshot) {
   el("progress-fill").parentElement.setAttribute("aria-valuenow", workflow.progress.percent);
   renderStepper(current?.phase, workflow.state);
   renderRack(snapshot.rack);
+  renderCaps3d();
   setReadiness(snapshot.readiness.issues.map(issue => issue.message));
   setCapabilities(snapshot.capabilities, workflow.state);
 }
@@ -604,6 +632,567 @@ function handleConsoleEvent(event) {
   if (event.message.startsWith("Tube debug detected center ")) {
     setText("locate-tube-status", event.message);
   }
+}
+
+/* --------------------------------------------------------------------------
+   Cap 3D view.
+
+   The server places every live cap detection in rack-frame millimetres with
+   pixel_to_real plus each colour's cap height. This view draws those caps as
+   cylinders over the nominal rack grid, with an orbit camera, so the offset
+   between where a tube actually is and where its slot expects it to be is
+   visible in 3D.
+   -------------------------------------------------------------------------- */
+
+const CAPS3D_FOV = (42 * Math.PI) / 180;
+const CAPS3D_DEFAULTS = {yaw: -2.35, pitch: 0.92, distance: 620};
+let caps3dFrameHandle = null;
+
+function initCaps3d() {
+  const canvas = el("caps3d-canvas");
+  if (!canvas) return;
+  el("caps3d-reset").addEventListener("click", () => {
+    state.caps3d.resetOnNextFrame = true;
+    renderCaps3d();
+  });
+  canvas.addEventListener("pointerdown", event => {
+    state.caps3d.dragging = true;
+    state.caps3d.lastX = event.clientX;
+    state.caps3d.lastY = event.clientY;
+    try { canvas.setPointerCapture(event.pointerId); } catch (error) { /* ignored */ }
+    canvas.classList.add("dragging");
+  });
+  canvas.addEventListener("pointermove", event => {
+    if (!state.caps3d.dragging) return;
+    const dx = event.clientX - state.caps3d.lastX;
+    const dy = event.clientY - state.caps3d.lastY;
+    state.caps3d.lastX = event.clientX;
+    state.caps3d.lastY = event.clientY;
+    state.caps3d.yaw -= dx * 0.008;
+    state.caps3d.pitch = caps3dClamp(state.caps3d.pitch + dy * 0.006, 0.12, 1.5);
+    renderCaps3d();
+  });
+  const endDrag = event => {
+    if (!state.caps3d.dragging) return;
+    state.caps3d.dragging = false;
+    canvas.classList.remove("dragging");
+    try { if (canvas.hasPointerCapture(event.pointerId)) canvas.releasePointerCapture(event.pointerId); } catch (error) { /* ignored */ }
+  };
+  canvas.addEventListener("pointerup", endDrag);
+  canvas.addEventListener("pointercancel", endDrag);
+  canvas.addEventListener("wheel", event => {
+    event.preventDefault();
+    const zoom = Math.exp(caps3dClamp(event.deltaY * 0.0012, -1, 1));
+    state.caps3d.distance = caps3dClamp(state.caps3d.distance * zoom, 90, 5000);
+    renderCaps3d();
+  }, {passive: false});
+  canvas.addEventListener("dblclick", () => {
+    state.caps3d.resetOnNextFrame = true;
+    renderCaps3d();
+  });
+  if (typeof ResizeObserver !== "undefined") {
+    new ResizeObserver(() => renderCaps3d()).observe(canvas.parentElement);
+  } else {
+    window.addEventListener("resize", renderCaps3d);
+  }
+}
+
+function startCaps3dPolling() {
+  if (state.caps3d.polling) return;
+  state.caps3d.polling = true;
+  const tick = async () => {
+    state.caps3d.pollTimer = null;
+    if (!state.caps3d.polling) return;
+    await refreshCaps3d();
+    if (state.caps3d.polling) state.caps3d.pollTimer = window.setTimeout(tick, 350);
+  };
+  tick();
+}
+
+function stopCaps3dPolling() {
+  state.caps3d.polling = false;
+  window.clearTimeout(state.caps3d.pollTimer);
+  state.caps3d.pollTimer = null;
+}
+
+async function refreshCaps3d() {
+  try {
+    const response = await fetch("/api/camera/caps", {cache: "no-store"});
+    if (!response.ok) throw new Error(`Cap placement failed (${response.status}).`);
+    state.caps3d.data = await response.json();
+    state.caps3d.error = null;
+  } catch (error) {
+    state.caps3d.error = error.message;
+  }
+  renderCaps3d();
+}
+
+function renderCaps3d() {
+  if (caps3dFrameHandle !== null) return;
+  caps3dFrameHandle = window.requestAnimationFrame(() => {
+    caps3dFrameHandle = null;
+    drawCaps3d();
+  });
+}
+
+function drawCaps3d() {
+  const canvas = el("caps3d-canvas");
+  if (!canvas) return;
+  const scene = buildCapsScene(state.caps3d.data);
+  updateCaps3dChrome(scene, state.caps3d.data);
+  const width = Math.max(1, canvas.clientWidth || canvas.parentElement?.clientWidth || 640);
+  const height = Math.max(1, canvas.clientHeight || canvas.parentElement?.clientHeight || 360);
+  const dpr = Math.min(window.devicePixelRatio || 1, 2);
+  if (canvas.width !== Math.round(width * dpr) || canvas.height !== Math.round(height * dpr)) {
+    canvas.width = Math.round(width * dpr);
+    canvas.height = Math.round(height * dpr);
+  }
+  const ctx = canvas.getContext("2d");
+  if (!ctx) return;
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  ctx.clearRect(0, 0, width, height);
+  if (!scene) return;
+  if (state.caps3d.resetOnNextFrame || !state.caps3d.target) resetCapsView(scene);
+  const view = caps3dProjector(width, height, state.caps3d);
+  caps3dDrawRack(ctx, view, scene);
+  const tubes = [];
+  for (const tube of scene.nominal) tubes.push({...tube, ghost: true});
+  for (const tube of scene.detected) tubes.push(tube);
+  tubes.sort((a, b) => caps3dDistance2(view.eye, b) - caps3dDistance2(view.eye, a));
+  for (const tube of tubes) caps3dDrawTube(ctx, view, tube);
+  caps3dDrawCamera(ctx, view, scene);
+  if (scene.detected.length && scene.detected.length <= 40) caps3dDrawLabels(ctx, view, scene);
+}
+
+function resetCapsView(scene) {
+  const size = Math.max(scene.extent, 120);
+  state.caps3d.target = {...scene.center};
+  state.caps3d.distance = size * 1.45;
+  state.caps3d.yaw = CAPS3D_DEFAULTS.yaw;
+  state.caps3d.pitch = CAPS3D_DEFAULTS.pitch;
+  state.caps3d.resetOnNextFrame = false;
+}
+
+function buildCapsScene(data) {
+  const snapshot = state.snapshot;
+  const rackData = data?.rack;
+  const snapshotTubes = snapshot?.rack?.tubes || [];
+  let rows = rackData?.rows ?? snapshot?.rack?.rows ?? 0;
+  let columns = rackData?.columns ?? snapshot?.rack?.columns ?? 0;
+  let origin = rackData?.origin_mm ? {...rackData.origin_mm} : null;
+  let pitch = rackData?.pitch_mm ? {...rackData.pitch_mm} : null;
+  if ((!origin || !pitch) && snapshotTubes.length) {
+    const first = snapshotTubes[0].position_mm;
+    const right = snapshotTubes.find(tube => tube.row === 1 && tube.column === 2);
+    const down = snapshotTubes.find(tube => tube.row === 2 && tube.column === 1);
+    origin = origin || {x: first.x, y: first.y, z: first.z};
+    pitch = pitch || {
+      x: right ? right.position_mm.x - first.x : 20.2,
+      y: down ? down.position_mm.y - first.y : 20.2,
+    };
+  }
+  if (!origin || !pitch || !rows || !columns) return null;
+
+  const heights = data?.cap_heights_mm || snapshot?.rack?.color_heights_mm || {};
+  const heightFor = color => {
+    const key = Object.keys(heights).find(name => name.toLowerCase() === String(color || "").toLowerCase());
+    const value = Number(heights[key]);
+    return Number.isFinite(value) ? value : 25;
+  };
+  const radius = Math.min(Math.abs(pitch.x), Math.abs(pitch.y)) * 0.27;
+
+  const slotCenter = (x, y) => {
+    const column = Math.min(columns - 1, Math.max(0, Math.round((x - origin.x) / pitch.x)));
+    const row = Math.min(rows - 1, Math.max(0, Math.round((y - origin.y) / pitch.y)));
+    return {
+      x: origin.x + column * pitch.x,
+      y: origin.y + row * pitch.y,
+      row: row + 1,
+      column: column + 1,
+    };
+  };
+
+  const detected = [];
+  for (const cap of data?.caps || []) {
+    if (!cap.placed) continue;
+    const x = Number(cap.x_mm);
+    const y = Number(cap.y_mm);
+    if (!Number.isFinite(x) || !Number.isFinite(y)) continue;
+    const height = Number(cap.cap_height_mm) || heightFor(cap.color);
+    const assigned = cap.slot && Number.isFinite(Number(cap.slot.row)) && Number.isFinite(Number(cap.slot.column))
+      ? {
+        x: origin.x + (Number(cap.slot.column) - 1) * pitch.x,
+        y: origin.y + (Number(cap.slot.row) - 1) * pitch.y,
+        row: Number(cap.slot.row),
+        column: Number(cap.slot.column),
+      }
+      : null;
+    const slot = assigned || slotCenter(x, y);
+    detected.push({
+      base: {x: slot.x, y: slot.y, z: 0},
+      top: {x, y, z: height},
+      height,
+      color: cap.color || null,
+      radius,
+      focus: Boolean(cap.focus),
+      slot,
+    });
+  }
+
+  const nominal = [];
+  for (const tube of snapshotTubes) {
+    if (!tube.color) continue;
+    const height = heightFor(tube.color);
+    nominal.push({
+      base: {x: tube.position_mm.x, y: tube.position_mm.y, z: 0},
+      top: {x: tube.position_mm.x, y: tube.position_mm.y, z: height},
+      height,
+      color: tube.color,
+      radius,
+    });
+  }
+
+  const spanX = Math.abs(pitch.x) * Math.max(1, columns);
+  const spanY = Math.abs(pitch.y) * Math.max(1, rows);
+  return {
+    rows,
+    columns,
+    origin,
+    pitch,
+    heights,
+    extent: Math.max(spanX, spanY),
+    center: {
+      x: origin.x + (pitch.x * (columns - 1)) / 2,
+      y: origin.y + (pitch.y * (rows - 1)) / 2,
+      z: 14,
+    },
+    detected,
+    nominal,
+    camera: data?.camera || null,
+  };
+}
+
+function updateCaps3dChrome(scene, data) {
+  const caps = data?.caps || [];
+  const placed = data?.placed_count || 0;
+  const live = Boolean(data && data.available);
+  if (!live) {
+    setChip("caps3d-chip", "CAMERA OFF", "neutral");
+  } else if (placed > 0) {
+    setChip("caps3d-chip", `3D · ${caps.length} CAP${caps.length === 1 ? "" : "S"}`, "ready");
+  } else if (caps.length > 0) {
+    setChip("caps3d-chip", `3D · ${caps.length} UNPLACED`, "warning");
+  } else {
+    setChip("caps3d-chip", "3D · NO CAPS", "warning");
+  }
+
+  let message = "";
+  if (!live) message = "Turn on the camera preview to place detected caps in 3D.";
+  else if (data && !data.machine?.known) message = "Gantry position is unknown, so caps cannot be placed yet. Home the machine and keep Klipper connected.";
+  else if (caps.length === 0) message = "No caps are visible in the current frame.";
+  else if (placed === 0) message = `${caps.length} cap(s) seen, but none has a known colour, so no height can be derived.`;
+  const empty = el("caps3d-empty");
+  empty.hidden = !message;
+  empty.textContent = message;
+
+  const parts = [];
+  if (data?.machine?.known) parts.push(`gantry X ${number(data.machine.x)} Y ${number(data.machine.y)} Z ${number(data.machine.z)} mm`);
+  if (data?.camera) {
+    const height = data.camera.height_mm + data.camera.raise_mm;
+    parts.push(`camera ${number(height)} mm above rack · tilt ${number(data.camera.tilt_deg)}°`);
+  }
+  if (data) parts.push(`${placed} of ${caps.length} caps placed`);
+  if (data?.unplaced_count) parts.push(`${data.unplaced_count} without a colour height`);
+  if (scene?.detected?.length) {
+    const maxTilt = scene.detected.reduce((max, tube) => Math.max(max, caps3dTiltDeg(tube)), 0);
+    if (maxTilt >= 1) parts.push(`max lean ${number(maxTilt)}°`);
+  }
+  setText("caps3d-details", parts.length ? `${parts.join(" · ")}. Drag to orbit, scroll to zoom.` : "Drag to orbit, scroll to zoom.");
+
+  const legend = el("caps3d-legend");
+  legend.replaceChildren();
+  const colors = new Map();
+  for (const cap of caps) {
+    if (!cap.placed) continue;
+    const key = cap.color || "unknown";
+    if (!colors.has(key)) colors.set(key, cap.cap_height_mm);
+  }
+  for (const [color, height] of colors) {
+    const item = document.createElement("span");
+    const swatch = document.createElement("i");
+    swatch.className = "caps3d-swatch";
+    swatch.style.background = capColor(color);
+    item.append(swatch, document.createTextNode(`${color} · ${number(height)} mm`));
+    legend.append(item);
+  }
+}
+
+function caps3dProjector(width, height, cam) {
+  const {target, yaw, pitch, distance} = cam;
+  const eye = {
+    x: target.x + distance * Math.cos(pitch) * Math.cos(yaw),
+    y: target.y + distance * Math.cos(pitch) * Math.sin(yaw),
+    z: target.z + distance * Math.sin(pitch),
+  };
+  const forward = caps3dNorm(caps3dSub(target, eye));
+  let right = caps3dNorm(caps3dCross(forward, {x: 0, y: 0, z: 1}));
+  if (!Number.isFinite(right.x) || Math.hypot(right.x, right.y, right.z) < 1e-6) right = {x: 1, y: 0, z: 0};
+  const up = caps3dCross(right, forward);
+  const focal = (height / 2) / Math.tan(CAPS3D_FOV / 2);
+  const project = point => {
+    const delta = caps3dSub(point, eye);
+    const depth = caps3dDot(delta, forward);
+    if (!Number.isFinite(depth) || depth <= 2) return null;
+    return {
+      x: width / 2 + (focal * caps3dDot(delta, right)) / depth,
+      y: height / 2 - (focal * caps3dDot(delta, up)) / depth,
+      depth,
+    };
+  };
+  return {eye, project};
+}
+
+function caps3dDrawRack(ctx, view, scene) {
+  const {origin, pitch, rows, columns} = scene;
+  const pad = 0.55;
+  const x0 = origin.x - pitch.x * pad;
+  const x1 = origin.x + pitch.x * (columns - 1) + pitch.x * pad;
+  const y0 = origin.y - pitch.y * pad;
+  const y1 = origin.y + pitch.y * (rows - 1) + pitch.y * pad;
+  const corners = [
+    {x: x0, y: y0, z: 0},
+    {x: x1, y: y0, z: 0},
+    {x: x1, y: y1, z: 0},
+    {x: x0, y: y1, z: 0},
+  ].map(point => view.project(point));
+  if (corners.some(point => !point)) return;
+  caps3dPoly(ctx, corners, "rgba(128, 140, 152, .10)", "rgba(128, 140, 152, .40)", 1.25);
+
+  ctx.save();
+  ctx.strokeStyle = "rgba(128, 140, 152, .28)";
+  ctx.lineWidth = 1;
+  for (let column = 0; column < columns; column++) {
+    const x = origin.x + column * pitch.x;
+    const start = view.project({x, y: y0, z: 0});
+    const end = view.project({x, y: y1, z: 0});
+    if (start && end) caps3dLine(ctx, start, end);
+  }
+  for (let row = 0; row < rows; row++) {
+    const y = origin.y + row * pitch.y;
+    const start = view.project({x: x0, y, z: 0});
+    const end = view.project({x: x1, y, z: 0});
+    if (start && end) caps3dLine(ctx, start, end);
+  }
+  ctx.restore();
+
+  const holeRadius = Math.min(Math.abs(pitch.x), Math.abs(pitch.y)) * 0.27;
+  ctx.save();
+  ctx.strokeStyle = "rgba(138, 148, 160, .55)";
+  ctx.lineWidth = 1.1;
+  for (let row = 0; row < rows; row++) {
+    for (let column = 0; column < columns; column++) {
+      const center = {x: origin.x + column * pitch.x, y: origin.y + row * pitch.y, z: 0};
+      const ring = caps3dRingPoints(center, holeRadius, 0, 14).map(point => view.project(point));
+      if (ring.every(point => point)) caps3dPoly(ctx, ring, null, "rgba(138, 148, 160, .55)", 1);
+    }
+  }
+  ctx.restore();
+}
+
+function caps3dDrawTube(ctx, view, tube) {
+  const segments = 18;
+  // The tube leans in its slot: base is the snapped slot, top is the detected cap.
+  const axis = caps3dNorm(caps3dSub(tube.top, tube.base));
+  const helper = Math.abs(axis.z) < 0.9 ? {x: 0, y: 0, z: 1} : {x: 1, y: 0, z: 0};
+  const u = caps3dNorm(caps3dCross(axis, helper));
+  const v = caps3dNorm(caps3dCross(axis, u));
+  const baseWorld = [];
+  const topWorld = [];
+  for (let index = 0; index < segments; index++) {
+    const angle = (index / segments) * Math.PI * 2;
+    const cos = Math.cos(angle);
+    const sin = Math.sin(angle);
+    const offset = {
+      x: (u.x * cos + v.x * sin) * tube.radius,
+      y: (u.y * cos + v.y * sin) * tube.radius,
+      z: (u.z * cos + v.z * sin) * tube.radius,
+    };
+    baseWorld.push({x: tube.base.x + offset.x, y: tube.base.y + offset.y, z: tube.base.z + offset.z});
+    topWorld.push({x: tube.top.x + offset.x, y: tube.top.y + offset.y, z: tube.top.z + offset.z});
+  }
+  const base = baseWorld.map(point => view.project(point));
+  const top = topWorld.map(point => view.project(point));
+  if (base.some(point => !point) || top.some(point => !point)) return;
+
+  const color = capColor(tube.color);
+  const alpha = tube.ghost ? 0.22 : 0.97;
+
+  if (!tube.ghost) {
+    const shadow = caps3dRingPoints({x: tube.base.x, y: tube.base.y}, tube.radius * 1.4, 0, segments)
+      .map(point => view.project(point));
+    if (shadow.every(point => point)) caps3dPoly(ctx, shadow, "rgba(0, 0, 0, .12)", null, 0);
+    if (tube.slot) {
+      // Ring on the snapped slot so the lean is readable even when the base is hidden.
+      const marker = caps3dRingPoints({x: tube.base.x, y: tube.base.y}, tube.radius * 1.55, 0, segments)
+        .map(point => view.project(point));
+      if (marker.every(point => point)) caps3dPoly(ctx, marker, null, caps3dRgba(color, .5), 1.2);
+    }
+  }
+
+  const light = caps3dNorm({x: -0.45, y: -0.5, z: 1});
+  for (let index = 0; index < segments; index++) {
+    const next = (index + 1) % segments;
+    const mid = ((index + 0.5) / segments) * Math.PI * 2;
+    const normal = {
+      x: u.x * Math.cos(mid) + v.x * Math.sin(mid),
+      y: u.y * Math.cos(mid) + v.y * Math.sin(mid),
+      z: u.z * Math.cos(mid) + v.z * Math.sin(mid),
+    };
+    const centerX = (baseWorld[index].x + baseWorld[next].x + topWorld[index].x + topWorld[next].x) / 4;
+    const centerY = (baseWorld[index].y + baseWorld[next].y + topWorld[index].y + topWorld[next].y) / 4;
+    const centerZ = (baseWorld[index].z + baseWorld[next].z + topWorld[index].z + topWorld[next].z) / 4;
+    if (caps3dDot(normal, {x: view.eye.x - centerX, y: view.eye.y - centerY, z: view.eye.z - centerZ}) <= 0) continue;
+    const shade = 0.62 + 0.38 * Math.max(0, caps3dDot(normal, light));
+    caps3dPoly(ctx, [base[index], base[next], top[next], top[index]], caps3dShade(color, shade, alpha), null, 0);
+  }
+
+  caps3dPoly(
+    ctx,
+    top,
+    tube.ghost ? caps3dRgba(color, 0.25) : caps3dTint(color, 0.14),
+    tube.focus ? "rgba(255, 255, 255, .95)" : caps3dRgba(color, tube.ghost ? 0.4 : 0.9),
+    tube.focus ? 2 : 1,
+  );
+}
+
+function caps3dDrawCamera(ctx, view, scene) {
+  const camera = scene.camera;
+  if (!camera) return;
+  const apex = view.project({x: camera.x, y: camera.y, z: camera.z});
+  if (!apex) return;
+  const half = 44;
+  const corners = [
+    {x: camera.x - half, y: camera.y - half, z: 0},
+    {x: camera.x + half, y: camera.y - half, z: 0},
+    {x: camera.x + half, y: camera.y + half, z: 0},
+    {x: camera.x - half, y: camera.y + half, z: 0},
+  ].map(point => view.project(point));
+  ctx.save();
+  ctx.setLineDash([4, 5]);
+  ctx.strokeStyle = "rgba(255, 168, 64, .55)";
+  ctx.lineWidth = 1;
+  for (const corner of corners) if (corner) caps3dLine(ctx, apex, corner);
+  ctx.setLineDash([]);
+  if (corners.every(point => point)) caps3dPoly(ctx, corners, null, "rgba(255, 168, 64, .35)", 1);
+  ctx.fillStyle = "#ffa840";
+  ctx.beginPath();
+  ctx.arc(apex.x, apex.y, 3.5, 0, Math.PI * 2);
+  ctx.fill();
+  ctx.restore();
+  caps3dLabel(ctx, "camera", apex.x + 7, apex.y - 6);
+}
+
+function caps3dDrawLabels(ctx, view, scene) {
+  for (const tube of scene.detected) {
+    const point = view.project({x: tube.top.x, y: tube.top.y, z: tube.top.z + 2});
+    if (!point) continue;
+    const tilt = caps3dTiltDeg(tube);
+    const suffix = tilt >= 1 ? ` · ${Math.round(tilt)}°` : "";
+    caps3dLabel(ctx, `${tube.color || "?"} ${Math.round(tube.height)}mm${suffix}`, point.x + 5, point.y - 5);
+  }
+}
+
+function caps3dLabel(ctx, text, x, y) {
+  ctx.save();
+  ctx.font = "600 11px ui-monospace, SFMono-Regular, Menlo, monospace";
+  const width = ctx.measureText(text).width;
+  ctx.fillStyle = "rgba(0, 0, 0, .55)";
+  ctx.beginPath();
+  if (typeof ctx.roundRect === "function") ctx.roundRect(x, y - 12, width + 8, 16, 4);
+  else ctx.rect(x, y - 12, width + 8, 16);
+  ctx.fill();
+  ctx.fillStyle = "#ffffff";
+  ctx.fillText(text, x + 4, y);
+  ctx.restore();
+}
+
+function caps3dRingPoints(center, radius, z, segments) {
+  const points = [];
+  for (let index = 0; index < segments; index++) {
+    const angle = (index / segments) * Math.PI * 2;
+    points.push({x: center.x + Math.cos(angle) * radius, y: center.y + Math.sin(angle) * radius, z});
+  }
+  return points;
+}
+
+function caps3dPoly(ctx, points, fill, stroke, width) {
+  if (!points.length || points.some(point => !point)) return;
+  ctx.beginPath();
+  ctx.moveTo(points[0].x, points[0].y);
+  for (let index = 1; index < points.length; index++) ctx.lineTo(points[index].x, points[index].y);
+  ctx.closePath();
+  if (fill) {
+    ctx.fillStyle = fill;
+    ctx.fill();
+  }
+  if (stroke && width) {
+    ctx.strokeStyle = stroke;
+    ctx.lineWidth = width;
+    ctx.stroke();
+  }
+}
+
+function caps3dLine(ctx, start, end) {
+  ctx.beginPath();
+  ctx.moveTo(start.x, start.y);
+  ctx.lineTo(end.x, end.y);
+  ctx.stroke();
+}
+
+function caps3dDistance2(eye, tube) {
+  const dx = eye.x - (tube.base.x + tube.top.x) / 2;
+  const dy = eye.y - (tube.base.y + tube.top.y) / 2;
+  const dz = eye.z - (tube.base.z + tube.top.z) / 2;
+  return dx * dx + dy * dy + dz * dz;
+}
+
+function caps3dTiltDeg(tube) {
+  const horizontal = Math.hypot(tube.top.x - tube.base.x, tube.top.y - tube.base.y);
+  const vertical = Math.max(1e-6, tube.top.z - tube.base.z);
+  return (Math.atan2(horizontal, vertical) * 180) / Math.PI;
+}
+
+function caps3dSub(a, b) { return {x: a.x - b.x, y: a.y - b.y, z: a.z - b.z}; }
+function caps3dDot(a, b) { return a.x * b.x + a.y * b.y + a.z * b.z; }
+function caps3dCross(a, b) {
+  return {x: a.y * b.z - a.z * b.y, y: a.z * b.x - a.x * b.z, z: a.x * b.y - a.y * b.x};
+}
+function caps3dNorm(value) {
+  const length = Math.hypot(value.x, value.y, value.z) || 1;
+  return {x: value.x / length, y: value.y / length, z: value.z / length};
+}
+function caps3dClamp(value, min, max) { return Math.min(max, Math.max(min, value)); }
+
+function caps3dRgb(hex) {
+  const cleaned = String(hex || "").replace("#", "");
+  const full = cleaned.length === 3 ? cleaned.split("").map(char => char + char).join("") : cleaned;
+  const value = parseInt(full, 16);
+  if (!Number.isFinite(value)) return {r: 154, g: 154, b: 154};
+  return {r: (value >> 16) & 255, g: (value >> 8) & 255, b: value & 255};
+}
+function caps3dRgba(hex, alpha) {
+  const {r, g, b} = caps3dRgb(hex);
+  return `rgba(${r}, ${g}, ${b}, ${alpha})`;
+}
+function caps3dTint(hex, amount) {
+  const {r, g, b} = caps3dRgb(hex);
+  const mix = channel => Math.round(channel + (255 - channel) * amount);
+  return `rgb(${mix(r)}, ${mix(g)}, ${mix(b)})`;
+}
+function caps3dShade(hex, factor, alpha) {
+  const {r, g, b} = caps3dRgb(hex);
+  const scale = channel => Math.round(channel * factor);
+  return `rgba(${scale(r)}, ${scale(g)}, ${scale(b)}, ${alpha})`;
 }
 
 function wireControls() {

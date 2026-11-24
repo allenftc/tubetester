@@ -40,6 +40,10 @@ class RackSettings:
     pickup_height_offset_mm_by_color: Mapping[str, float]
     columns: int = 1
     rows: int = 1
+    # How far (mm) a detected cap may sit from the slot center and still be
+    # treated as that slot's tube. Defaults to 0.75 of the X pitch; slots
+    # compete for caps one-to-one, so overlapping limits are fine.
+    slot_match_tolerance_mm: float | None = None
 
     def tube_position(self, row: int, column: int) -> Point3D:
         return Point3D(
@@ -52,6 +56,22 @@ class RackSettings:
         """Return rack pickup height plus the selected color's Z offset."""
         offset = 0.0 if color is None else self.pickup_height_offset_mm_by_color.get(color, 0.0)
         return self.pickup_height_mm + offset
+
+    def cap_height_for_color(self, color: str | None) -> float | None:
+        """Cap height above the rack top for a color, or None if unknown.
+
+        The per-color offsets are how far the camera is raised so the cap sits
+        where the rack top was during calibration, i.e. the cap height.
+        """
+        if color is None:
+            return None
+        return self.pickup_height_offset_mm_by_color.get(color)
+
+    @property
+    def slot_tolerance_mm(self) -> float:
+        if self.slot_match_tolerance_mm is not None:
+            return self.slot_match_tolerance_mm
+        return 0.75 * self.tube_pitch_mm.x
 
     def calibrated_scan_height_for_color(self, color: str | None) -> float:
         """Return the offset calibration height for the selected color."""
@@ -159,6 +179,11 @@ def load_settings(config_dir: Path) -> ControllerSettings:
         pickup_height_offset_mm_by_color=pickup_height_offset_mm_by_color,
         columns=int(rack_data.get("columns", 1)),
         rows=int(rack_data.get("rows", 1)),
+        slot_match_tolerance_mm=(
+            float(rack_data["slot_match_tolerance_mm"])
+            if "slot_match_tolerance_mm" in rack_data
+            else None
+        ),
     )
     yaw = YawSettings(
         start_deg=float(yaw_data["start_deg"]),

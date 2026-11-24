@@ -16,7 +16,8 @@
     "green": 17.8,
     "light teal": 49.9
   },
-  "scan_height_mm": 45,
-  "scan_height_with_offset": 16,
+  "scan_height_mm": 75,
+  "slot_match_tolerance_mm": 15.0,
+  "scan_height_with_offset": 50,
   "post_pickup_height_mm": 150
 }

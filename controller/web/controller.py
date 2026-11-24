@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import math
 from copy import deepcopy
 from importlib.metadata import PackageNotFoundError, version
 from typing import Any, Protocol
@@ -10,6 +11,7 @@ from controller.motion.klipper_client import KlipperMotionClient
 from controller.network.moonraker import MoonrakerClient, MoonrakerResponse
 from controller.workflow.state_machine import ScanStep, TubeScanWorkflow
 from controller.web.events import EventStore, utc_timestamp
+from controller.web.errors import RuntimeConflict
 from controller.web.actions import CameraPickupActions, MachineActions, WorkflowControlActions
 
 _ACTIVE_STATES = {"starting", "running", "paused", "stopping"}
@@ -77,6 +79,61 @@ class WorkflowController(MachineActions, CameraPickupActions, WorkflowControlAct
     def debug_pickup_active(self) -> bool:
         return bool(self._debug_pickup and self._debug_pickup["state"] in {"running", "failed"})
 
+    @property
+    def poll_interval_seconds(self) -> float:
+        return self._poll_interval_seconds
+
+    @property
+    def busy(self) -> bool:
+        """True while a workflow or camera pickup is using the machine."""
+        return self._workflow["state"] in _ACTIVE_STATES or self.debug_pickup_active
+
+    async def apply_settings(self, settings: ControllerSettings) -> None:
+        """Swap calibration settings into a running controller.
+
+        Refused while the machine is moving so a mid-scan edit cannot change a
+        target height or rack size underneath the active workflow.
+        """
+        if self.busy:
+            raise RuntimeConflict("Calibration cannot be applied while the workflow or camera pickup is active.")
+        async with self._lock:
+            self.settings = settings
+            self.workflow_builder = TubeScanWorkflow(settings)
+            if hasattr(self.moonraker, "settings"):
+                self.moonraker.settings = settings.network.moonraker
+            self._tubes = self._resized_tubes()
+            progress = self._workflow["progress"]
+            progress["total_tubes"] = len(self._tubes)
+            progress["total_steps"] = len(self.workflow_builder.build_plan().steps)
+            self._update_percent_and_summary()
+        self._broadcast_status()
+
+    def _resized_tubes(self) -> list[dict[str, Any]]:
+        """Rebuild the rack grid, keeping results for tubes that still exist."""
+        previous = {(tube["row"], tube["column"]): tube for tube in self._tubes}
+        tubes = self._new_tubes()
+        for tube in tubes:
+            old = previous.get((tube["row"], tube["column"]))
+            if old is None:
+                continue
+            for key in (
+                "phase",
+                "yaw_attempt",
+                "decoded_payload",
+                "color",
+                "confidence",
+                "frame_id",
+                "error",
+                "started_at",
+                "decoded_at",
+                "released_at",
+            ):
+                tube[key] = old[key]
+            tube["status"] = (
+                "pending" if old["status"] in {"approaching", "picked_up", "scanning"} else old["status"]
+            )
+        return tubes
+
     async def initialize(self) -> None:
         await self.refresh_machine()
         self._start_machine_monitor()
@@ -121,6 +178,7 @@ class WorkflowController(MachineActions, CameraPickupActions, WorkflowControlAct
                 response = await asyncio.to_thread(self.moonraker.get_printer_info)
             except Exception as exc:  # defensive boundary around hardware adapter
                 response = MoonrakerResponse(False, 0, error_message=str(exc))
+            position = await self._query_toolhead_position() if response.ok else None
             async with self._lock:
                 previous = (
                     self._machine["connected"],
@@ -150,6 +208,8 @@ class WorkflowController(MachineActions, CameraPickupActions, WorkflowControlAct
                         klipper_state=state,
                         state_message=str(result.get("state_message", "Printer information received.")),
                     )
+                    if position is not None:
+                        self._machine["position_mm"] = position
                     if state != "ready":
                         self._hardware_initialized = False
                 changed = previous != (
@@ -161,6 +221,27 @@ class WorkflowController(MachineActions, CameraPickupActions, WorkflowControlAct
                 await self._initialize_tooling()
             if changed:
                 self._broadcast_status()
+
+    async def _query_toolhead_position(self) -> dict[str, float] | None:
+        """Read the live toolhead position when the backend supports it."""
+        getter = getattr(self.moonraker, "get_toolhead_position", None)
+        if getter is None:
+            return None
+        try:
+            response = await asyncio.to_thread(getter)
+        except Exception:
+            return None
+        if not response.ok:
+            return None
+        result = (response.payload or {}).get("result", response.payload or {})
+        toolhead = (result.get("status") or {}).get("toolhead") or {}
+        position = toolhead.get("position")
+        if not isinstance(position, (list, tuple)) or len(position) < 3:
+            return None
+        values = [float(value) for value in position[:3]]
+        if not all(math.isfinite(value) for value in values):
+            return None
+        return {"x": values[0], "y": values[1], "z": values[2]}
 
     async def _initialize_tooling(self) -> None:
         async with self._hardware_lock:

@@ -13,3 +13,98 @@
     min-width: 380px;
   }
 }
+
+/* ==========================================================================
+   Cap 3D view
+   ========================================================================== */
+
+.caps3d-card {
+  margin-top: 12px;
+}
+
+.caps3d-toolbar {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.caps3d-stage {
+  position: relative;
+  height: clamp(340px, 54vh, 620px);
+  margin-top: 12px;
+  border: 1px solid var(--stroke);
+  border-radius: 8px;
+  overflow: hidden;
+  background:
+    radial-gradient(120% 80% at 50% 0%, rgba(120, 140, 160, .12), transparent 65%),
+    var(--layer-alt);
+}
+
+#caps3d-canvas {
+  display: block;
+  width: 100%;
+  height: 100%;
+  cursor: grab;
+  touch-action: none;
+}
+
+#caps3d-canvas.dragging {
+  cursor: grabbing;
+}
+
+.caps3d-empty {
+  position: absolute;
+  inset: 0;
+  margin: 0;
+  display: grid;
+  place-items: center;
+  padding: 24px;
+  text-align: center;
+  color: var(--text-3);
+  pointer-events: none;
+  font-size: 14px;
+}
+
+.caps3d-empty[hidden] {
+  display: none;
+}
+
+.caps3d-footer {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 16px;
+  flex-wrap: wrap;
+  margin-top: 10px;
+}
+
+.caps3d-footer p {
+  margin: 0;
+}
+
+.caps3d-legend {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px 14px;
+}
+
+.caps3d-legend > span {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 12px;
+  color: var(--text-2);
+}
+
+.caps3d-swatch {
+  width: 10px;
+  height: 10px;
+  border-radius: 50%;
+  box-shadow: inset 0 0 0 1px rgba(0, 0, 0, .18);
+}
+
+@media (max-width: 640px) {
+  .caps3d-stage {
+    height: 330px;
+  }
+}

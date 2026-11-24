@@ -3,35 +3,35 @@
   "coordinate_units": "mm",
   "pixel_to_world_homography": [
     [
-      0.18019287369869388,
-      0.17957743683590033,
-      -60.08284064837487
+      0.17355245358357677,
+      0.17303285364471252,
+      -66.97178516491577
     ],
     [
-      0.1786814510828655,
-      -0.18093260999125343,
-      -24.78449559761731
+      0.17404275917890832,
+      -0.17259463261341979,
+      -34.720890931888576
     ],
     [
-      8.902386455349605e-06,
-      1.575346761254155e-05,
+      -3.284311966898842e-05,
+      -3.9553069775488066e-05,
       1.0
     ]
   ],
   "world_to_pixel_homography": [
     [
-      2.7908854618841605,
-      2.790603836534635,
-      236.84803497553875
+      2.896119025473304,
+      2.8364540342056124,
+      292.4424723409918
     ],
     [
-      2.765532579982232,
-      -2.7937543186028995,
-      96.91926170072355
+      2.8783806304615736,
+      -2.8525850141755575,
+      93.72599605499808
     ],
     [
-      -6.841226886448824e-05,
-      1.916828437889628e-05,
+      0.0002089663736463138,
+      -1.967049482519752e-05,
       1.0
     ]
   ],
@@ -41,12 +41,13 @@
   "manual_coordinates_are_absolute": false,
   "pitch": 20.2,
   "origin_offset": [
-    10.1,
-    10.1
+    0.0,
+    0.0
   ],
   "camera_to_board_distance": null,
-  "mean_corner_reprojection_error": 0.25331126610942756,
+  "mean_corner_reprojection_error": 0.2385833281889011,
   "mapping_scope": "the rack top-surface plane only",
-  "source_image": "photo_20261119_001704_655.png (640x480 raw pixels, no undistortion)",
-  "notes": "Fit to 29 rail-top intersections at multiples of 20.2 mm. Slot (i,j) center = (i*20.2+10.1, j*20.2+10.1) mm; green-tube slot is (0,0). +X toward image lower-right, +Y toward image upper-right (same axes as the previous mapping)."
+  "source_image": "photo_20261119_130532_663.png (640x480 raw pixels, no undistortion)",
+  "notes": "Fit to 20 rail-top intersections. World (0,0) = rail crossing at the white block's corner nearest the camera (end effector is centered 50 mm above it). Crossings at (i*20.2, j*20.2) mm; slot centers at (i*20.2+10.1, j*20.2+10.1). +X toward image lower-right, +Y toward image upper-right. 50mm above the surface.",
+  "gantry_z_mm": 50.0
 }
