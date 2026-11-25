@@ -19,5 +19,6 @@
   "scan_height_mm": 75,
   "slot_match_tolerance_mm": 15.0,
   "scan_height_with_offset": 50,
+  "survey_height_mm": 80,
   "post_pickup_height_mm": 150
 }

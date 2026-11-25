@@ -46,11 +46,23 @@ MIN_COLOR_SAMPLES = 8
 COLOR_NAMES = ("gray", "white", "red", "purple", "green", "light teal")
 
 DEFAULT_COLOR_RANGES: tuple[ColorRange, ...] = (
-    ColorRange("white", (0, 5, 40), (35, 40, 100), priority=1, relative_value=True),
-    ColorRange("red", (0, 35, 80), (20, 100, 100), priority=2),
+    # White caps are pale ivory, and the annulus average wanders between ~30°
+    # and ~60° hue as the cap's centre shifts by a pixel or two. Keep a wide
+    # warm-hue band; the white/gray tie-break below stops cream-grays becoming
+    # white.
+    ColorRange("white", (0, 5, 40), (70, 40, 100), priority=1, relative_value=True),
+    # Red caps sit under a strong shadow/highlight gradient, so the annulus
+    # average is much dimmer than a clean swatch. Keep the value floor low and
+    # put the saturation floor above gray's range so dark gray caps cannot be
+    # pulled into red.
+    ColorRange("red", (0, 45, 40), (20, 100, 100), priority=2),
     ColorRange("purple", (300, 25, 50), (360, 100, 100), priority=2),
-    ColorRange("green", (160, 67, 15), (200, 100, 55), priority=2),
-    ColorRange("light teal", (105, 5, 50), (170, 35, 100), priority=3),
+    # Dark teal caps measure 26-51% value and can climb above the old 55%
+    # ceiling in brighter light, which dropped them out of green.
+    ColorRange("green", (160, 67, 15), (200, 100, 75), priority=2),
+    # Pale mint caps measure 146-164 deg hue with edge pixels near 175 deg; the
+    # old 170 deg/35% ceiling made them flicker out of light teal.
+    ColorRange("light teal", (105, 5, 50), (190, 45, 100), priority=3),
     ColorRange("gray", (0, 0, 0), (360, 40, 70), priority=1),
 )
 
@@ -70,7 +82,7 @@ pixel_to_world = np.array(
 CALIBRATION_GANTRY_Z_MM = float(calibration.get("gantry_z_mm", 50.0))
 # Whole-frame cap radius limits (pixels). Caps get bigger as the camera
 # descends, so these cover both the survey and the close-up height.
-FULL_FRAME_MIN_RADIUS_PX = 12
+FULL_FRAME_MIN_RADIUS_PX = 13
 FULL_FRAME_MAX_RADIUS_PX = 90
 
 
@@ -396,6 +408,17 @@ class TubeLocator:
 
 		if not matching_ranges:
 			return None
+		# White and gray overlap in the low-saturation band. Only let white win
+		# when it is clearly brighter than the rack; otherwise a gray cap is
+		# reported as white.
+		names = {name for _, name in matching_ranges}
+		if "white" in names and "gray" in names and background_value:
+			if value <= int(background_value * 1.25):
+				matching_ranges = [
+					(priority, name)
+					for priority, name in matching_ranges
+					if name != "white"
+				]
 		return max(matching_ranges)[1]
 
 	@staticmethod
@@ -700,6 +723,7 @@ class TubeLocator:
 				radius=fr,
 				color=self._classify_color(frame, (x, y), radius=radius, samples_mask=mask),
 			))
+		circles = self._drop_inner_holes(circles)
 		if raw_circles:
 			nearest = min(raw_circles, key=lambda c: (c[0] - width / 2) ** 2 + (c[1] - height / 2) ** 2)
 			self._classify_color(frame, nearest[:2], radius=nearest[2], samples_mask=mask)
@@ -710,7 +734,7 @@ class TubeLocator:
 			small(frame),
 			small(gray),
 			small(hough_input),
-			[(int(x * scale), int(y * scale), max(1, int(r * scale))) for x, y, r in raw_circles],
+			[(int(c.x * scale), int(c.y * scale), max(1, int(c.radius * scale))) for c in circles],
 		)
 		return circles, raw_mask, debug_montage
 
@@ -832,6 +856,33 @@ class TubeLocator:
 			if not is_inner_detection:
 				kept.append(candidate)
 		return kept
+
+	@staticmethod
+	def _drop_inner_holes(
+		circles: list[CapCircle],
+		min_reference_radius: float = 22.0,
+		fraction: float = 0.55,
+	) -> list[CapCircle]:
+		"""Drop small detections that sit well below the frame's typical cap size.
+
+		When a cap's outer rim is missed, Hough can report the dark inner hole as
+		its own circle. Holes are roughly 40% of the cap radius, so use the
+		frame's 80th-percentile radius as the reference. Below
+		``min_reference_radius`` every cap is small (high survey), so radius is
+		not diagnostic and nothing is dropped. White caps are exempt because
+		their short tubes genuinely project smaller than the tall colours.
+		"""
+		if len(circles) < 2:
+			return circles
+		reference = float(np.percentile([circle.radius for circle in circles], 80))
+		if reference < min_reference_radius:
+			return circles
+		limit = fraction * reference
+		return [
+			circle
+			for circle in circles
+			if circle.radius >= limit or (circle.color or "").lower() == "white"
+		]
 
 	@classmethod
 	def _circle_priority(

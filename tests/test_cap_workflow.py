@@ -5,8 +5,10 @@ import unittest
 
 import cv2
 import numpy as np
+from aiohttp.test_utils import TestClient, TestServer
 
 from controller.config.settings import load_settings
+from controller.web.server import create_control_app
 from controller.vision.tubeLocator.cap_matching import (
     LocatedCap,
     MergedCircle,
@@ -114,6 +116,32 @@ class SlotAssignmentTests(unittest.TestCase):
 
 
 class WholeFrameDetectionTests(unittest.TestCase):
+    def test_drop_inner_holes_keeps_white_caps(self) -> None:
+        circles = [
+            CapCircle(0.0, 0.0, 35.0, "red"),
+            CapCircle(30.0, 0.0, 33.0, "red"),
+            CapCircle(60.0, 0.0, 14.0, "red"),    # inner hole
+            CapCircle(90.0, 0.0, 15.0, "gray"),   # inner hole
+            CapCircle(120.0, 0.0, 14.0, "white"),  # short white cap
+            CapCircle(150.0, 0.0, 20.0, "green"),  # short but above the hole ratio
+        ]
+        kept = TubeLocator._drop_inner_holes(circles)
+        self.assertEqual([(c.x, c.color) for c in kept], [
+            (0.0, "red"),
+            (30.0, "red"),
+            (120.0, "white"),
+            (150.0, "green"),
+        ])
+
+    def test_drop_inner_holes_does_nothing_when_every_cap_is_small(self) -> None:
+        circles = [
+            CapCircle(0.0, 0.0, 16.0, "red"),
+            CapCircle(30.0, 0.0, 15.0, "red"),
+            CapCircle(60.0, 0.0, 14.0, "purple"),
+            CapCircle(90.0, 0.0, 9.0, "red"),
+        ]
+        self.assertEqual(TubeLocator._drop_inner_holes(circles), circles)
+
     def test_detects_every_cap_without_an_roi(self) -> None:
         frame = np.full((480, 640, 3), (200, 80, 20), dtype=np.uint8)  # blue rack
         caps = {(120, 380): (40, 40, 220), (330, 240): (40, 40, 220), (540, 90): (40, 40, 220)}
@@ -131,6 +159,29 @@ class WholeFrameDetectionTests(unittest.TestCase):
         for circle in circles:
             self.assertGreater(circle.radius, 25)  # outer rim, not the hole
             self.assertEqual(circle.color, "red")
+
+
+class StaticCirclePreview(FakeCameraPreview):
+    """Streaming camera fake that returns a fixed set of merged circles."""
+
+    def __init__(self, circles: list[MergedCircle]) -> None:
+        super().__init__()
+        self.circles = circles
+        self.sequence = 3
+
+    def status(self) -> dict[str, object]:
+        status = super().status()
+        status["sequence"] = self.sequence
+        return status
+
+    def wait_for_circle_detections(self, after_sequence: int, frame_count: int = 10, timeout_seconds: float = 8.0):
+        return {
+            "circles": self.circles,
+            "frame_count": frame_count,
+            "width": 640,
+            "height": 480,
+            "sequence": self.sequence,
+        }
 
 
 class FakeCirclePreview(FakeCameraPreview):
@@ -238,6 +289,101 @@ class CameraPickupWorkflowTests(unittest.IsolatedAsyncioTestCase):
             await self.runtime.run_camera_pickup_step(session["session_id"], camera)  # type: ignore[arg-type]
         self.assertEqual(len(self.moonraker.commands), 1)
         self.assertEqual(self.runtime._debug_pickup["state"], "failed")
+
+
+class SurveyTubesTests(unittest.IsolatedAsyncioTestCase):
+    async def asyncSetUp(self) -> None:
+        self.settings = load_settings(SETTINGS_DIR)
+        self.moonraker = FakeMoonraker(ready=True)
+        self.runtime = WorkflowRuntime(self.settings, moonraker=self.moonraker)
+        await self.runtime.refresh_machine()
+        self.moonraker.commands.clear()
+        self.rack = self.settings.rack
+
+    def _cap(self, world_xy, color, camera_xy, z):
+        height = self.rack.cap_height_for_color(color)
+        pixel = real_to_pixel(
+            world_xy[0] - camera_xy[0],
+            world_xy[1] - camera_xy[1],
+            height_mm=height,
+            camera_raise_mm=z - CALIBRATION_GANTRY_Z_MM,
+        )
+        return MergedCircle(*pixel, 30.0, color, 10)
+
+    async def test_survey_populates_visible_slots_after_climbing(self) -> None:
+        row, column = 2, 2
+        slot = self.rack.tube_position(row - 1, column - 1)
+        offset = self.rack.camera_offset_mm
+        camera_xy = (slot.x - offset.x, slot.y - offset.y)
+        z = self.rack.survey_height_mm
+        red_slot = self.rack.tube_position(0, 0)
+        white_slot = self.rack.tube_position(0, 1)
+        camera = StaticCirclePreview([
+            self._cap((red_slot.x + 2.0, red_slot.y - 1.0), "red", camera_xy, z),
+            self._cap((white_slot.x - 1.0, white_slot.y + 2.0), "white", camera_xy, z),
+        ])
+
+        result = await self.runtime.survey_tubes(row, column, camera)  # type: ignore[arg-type]
+
+        self.assertEqual(result["caps_seen"], 2)
+        self.assertEqual(len(result["tubes_populated"]), 2)
+        snapshot = await self.runtime.snapshot()
+        colors = {(tube["row"], tube["column"]): tube["color"] for tube in snapshot["rack"]["tubes"]}
+        self.assertEqual(colors[(1, 1)], "red")
+        self.assertEqual(colors[(1, 2)], "white")
+        red = snapshot["rack"]["tubes"][0]
+        self.assertAlmostEqual(red["survey"]["offset_x_mm"], 2.0, places=6)
+        self.assertAlmostEqual(red["survey"]["offset_y_mm"], -1.0, places=6)
+        self.assertAlmostEqual(
+            red["survey"]["cap_height_mm"],
+            self.rack.cap_height_for_color("red"),
+            places=6,
+        )
+        expected_tilt = float(np.degrees(np.arctan2(np.hypot(2.0, 1.0), self.rack.cap_height_for_color("red"))))
+        self.assertAlmostEqual(red["survey"]["tilt_deg"], expected_tilt, places=5)
+        self.assertIsNone(snapshot["rack"]["tubes"][2]["survey"])
+        self.assertEqual(snapshot["rack"]["survey_height_mm"], z)
+        motion = self.runtime.motion
+        # Climb to the survey height before travelling over the rack.
+        self.assertEqual(self.moonraker.commands, [
+            "\n".join((
+                motion.synchronized_move_command(z=z, feedrate=10000),
+                motion.synchronized_move_command(x=camera_xy[0], y=camera_xy[1], feedrate=10000),
+            )),
+        ])
+        self.assertTrue(camera.finished)
+
+    async def test_survey_endpoint_returns_the_populated_tubes(self) -> None:
+        row, column = 2, 2
+        slot = self.rack.tube_position(row - 1, column - 1)
+        offset = self.rack.camera_offset_mm
+        camera_xy = (slot.x - offset.x, slot.y - offset.y)
+        z = self.rack.survey_height_mm
+        red_slot = self.rack.tube_position(0, 0)
+        camera = StaticCirclePreview([self._cap((red_slot.x, red_slot.y), "red", camera_xy, z)])
+        client = TestClient(TestServer(create_control_app(
+            self.settings,
+            runtime=self.runtime,
+            camera_preview=camera,
+            initialize_hardware=False,
+        )))
+        await client.start_server()
+        try:
+            response = await client.post(
+                "/api/actions/survey-tubes",
+                json={"row": row, "column": column},
+            )
+            payload = await response.json()
+        finally:
+            await client.close()
+            await self.runtime.close()
+
+        self.assertEqual(response.status, 200)
+        self.assertEqual(payload["action"], "camera.survey")
+        self.assertEqual(payload["caps_seen"], 1)
+        self.assertEqual(payload["tubes_populated"][0]["row"], 1)
+        self.assertEqual(payload["tubes_populated"][0]["column"], 1)
+        self.assertEqual(payload["tubes_populated"][0]["color"], "red")
 
 
 if __name__ == "__main__":

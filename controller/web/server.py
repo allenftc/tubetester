@@ -68,8 +68,10 @@ def create_control_app(
     app.router.add_post("/api/camera/color-range-recording", _camera_color_range_recording)
     app.router.add_post("/api/camera/photo", _camera_photo)
     app.router.add_post("/api/actions/home", _home)
+    app.router.add_post("/api/actions/klipper-restart", _restart_klipper)
     app.router.add_post("/api/actions/preview", _preview)
     app.router.add_post("/api/actions/locate-tube", _locate_tube)
+    app.router.add_post("/api/actions/survey-tubes", _survey_tubes)
     app.router.add_post("/api/actions/stereo-test", _stereo_test)
     app.router.add_post("/api/actions/locate-tube/step", _locate_tube_step)
     app.router.add_post("/api/actions/locate-tube/cancel", _cancel_locate_tube)
@@ -78,6 +80,7 @@ def create_control_app(
     app.router.add_post("/api/tooling/vacuum/off", _tooling_vacuum_off)
     app.router.add_post("/api/tooling/rotary/zero", _rotary_zero)
     app.router.add_post("/api/tooling/rotary/move", _rotary_move)
+    app.router.add_post("/api/tooling/rotary/sweep", _rotary_sweep)
     app.router.add_post("/api/macros/calibrate", _macro_calibrate)
     app.router.add_post("/api/macros/pickup", _macro_pickup)
     app.router.add_post("/api/macros/deposit", _macro_deposit)
@@ -653,6 +656,11 @@ async def _home(request: web.Request) -> web.Response:
     return web.json_response(await request.app["runtime"].home())
 
 
+async def _restart_klipper(request: web.Request) -> web.Response:
+    await _json_body(request, allow_empty=True)
+    return web.json_response(await request.app["runtime"].restart_klipper())
+
+
 async def _preview(request: web.Request) -> web.Response:
     await _json_body(request, allow_empty=True)
     return web.json_response(request.app["runtime"].preview())
@@ -668,6 +676,23 @@ async def _locate_tube(request: web.Request) -> web.Response:
         raise ValueError("column must be an integer")
     return web.json_response(
         await request.app["runtime"].begin_camera_pickup(
+            row,
+            column,
+            request.app["camera_preview"],
+        )
+    )
+
+
+async def _survey_tubes(request: web.Request) -> web.Response:
+    body = await _json_body(request)
+    row = body.get("row")
+    column = body.get("column")
+    if isinstance(row, bool) or not isinstance(row, int):
+        raise ValueError("row must be an integer")
+    if isinstance(column, bool) or not isinstance(column, int):
+        raise ValueError("column must be an integer")
+    return web.json_response(
+        await request.app["runtime"].survey_tubes(
             row,
             column,
             request.app["camera_preview"],
@@ -744,6 +769,11 @@ async def _rotary_move(request: web.Request) -> web.Response:
     if isinstance(degrees, bool) or not isinstance(degrees, int):
         raise ValueError("degrees must be an integer")
     return web.json_response(await request.app["runtime"].rotate_to_position(degrees))
+
+
+async def _rotary_sweep(request: web.Request) -> web.Response:
+    await _json_body(request, allow_empty=True)
+    return web.json_response(await request.app["runtime"].sweep_rotary())
 
 
 async def _macro_calibrate(request: web.Request) -> web.Response:

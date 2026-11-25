@@ -7,9 +7,9 @@
   <meta name="theme-color" content="#f3f3f3" media="(prefers-color-scheme: light)">
   <meta name="theme-color" content="#202020" media="(prefers-color-scheme: dark)">
   <title>Tube Tester Control</title>
-  <link rel="stylesheet" href="/static/app.css?v=17">
-  <link rel="stylesheet" href="/static/rack.css?v=17">
-  <script src="/static/app.js?v=17" defer></script>
+  <link rel="stylesheet" href="/static/app.css?v=21">
+  <link rel="stylesheet" href="/static/rack.css?v=21">
+  <script src="/static/app.js?v=21" defer></script>
 </head>
 <body>
   <div id="stale-banner" class="stale-banner" role="status" hidden>Live connection interrupted. Reconnecting…</div>
@@ -104,23 +104,22 @@
           <div class="controls" aria-label="Machine and workflow controls">
             <div class="control-item">
               <button id="home-button" title="Home all Klipper axes before scanning." disabled>Home Machine</button>
-              <small>Home all axes</small>
+            </div>
+            <div class="control-item">
+              <button id="restart-klipper-button" class="secondary" title="Run FIRMWARE_RESTART through Moonraker. Power the SKR back on before using this." disabled>Restart Klipper</button>
             </div>
             <div class="control-item">
               <button id="preview-button" class="secondary" title="Validate the rack plan without moving hardware." disabled>Preview Run</button>
-              <small>Validate without motion</small>
             </div>
             <div class="control-item">
               <button id="start-button" class="primary" title="Scan every pending tube in rack order." disabled>Start Scan</button>
-              <small>Scan pending tubes</small>
             </div>
             <div class="control-item">
               <button id="pause-button" class="secondary" title="Pause after the active Moonraker command finishes." disabled>Pause</button>
-              <small id="pause-description">Hold safely</small>
+              <small id="pause-description" class="sr-only">Hold safely</small>
             </div>
             <div class="control-item">
               <button id="stop-button" class="danger" title="Stop after the active command; this is not an emergency stop." disabled>Stop</button>
-              <small>End cooperatively</small>
             </div>
           </div>
         </section>
@@ -163,6 +162,7 @@
           <div id="tube-details" class="tube-details" aria-live="polite">Select a tube to inspect its calibrated position and result.</div>
 
           <div class="action-strip" aria-label="Camera-guided test and pickup controls">
+            <button id="survey-selected-tube-button" class="secondary" title="Raise high above the selected tube and populate every cap the camera sees in the rack selector." disabled>Populate From Camera</button>
             <button id="stereo-test-button" class="secondary" title="Capture a left and right stereo view and report the tube position relative to their midpoint. Does not pick up the tube." disabled>Test Stereo Position</button>
             <button id="locate-selected-tube-button" class="secondary" title="Prepare a camera-guided pickup session." disabled>Begin Pickup Steps</button>
             <button id="run-next-pickup-step-button" class="primary" hidden disabled>Run Next Step</button>
@@ -189,26 +189,26 @@
               <div class="controls tooling-controls" aria-label="Vacuum and rotary controls">
                 <div class="control-item">
                   <button id="tooling-release-button" class="secondary" title="Pulse the release solenoid for 500 ms." disabled>Release Tube</button>
-                  <small>Solenoid pulse · 500 ms</small>
                 </div>
                 <div class="control-item">
                   <button id="tooling-vacuum-button" class="secondary" title="Turn on the vacuum pump." disabled>Vacuum On</button>
-                  <small>Pump stays active</small>
                 </div>
                 <div class="control-item">
                   <button id="tooling-vacuum-off-button" class="secondary" title="Turn off the vacuum pump." disabled>Vacuum Off</button>
-                  <small>Stops the pump</small>
                 </div>
                 <div class="control-item">
                   <button id="tooling-zero-button" class="secondary" title="Set the current rotary position to zero." disabled>Zero Rotary</button>
                 </div>
+                <div class="control-item">
+                  <button id="tooling-rotary-sweep-button" class="secondary" title="Slowly sweep the rotary from -180° to +180°, or back to -180°, whichever end it is not at. Speed 300." disabled>Sweep Rotary</button>
+                </div>
                 <div class="control-item rotary-control">
-                  <label for="rotary-degrees-input">Rotary position (degrees)</label>
+                  <label for="rotary-degrees-input">Rotary position (degrees, -180 to 180)</label>
                   <div class="inline-control">
-                    <input id="rotary-degrees-input" type="number" step="1" inputmode="numeric" autocomplete="off" placeholder="45" disabled>
+                    <input id="rotary-degrees-input" type="number" step="1" min="-180" max="180" inputmode="numeric" autocomplete="off" placeholder="45" disabled>
                     <button id="rotary-move-button" class="secondary" title="Move the rotary stepper to the requested position." disabled>Move</button>
                   </div>
-                  <small>Klipper manual stepper: rotary</small>
+                  <small id="rotary-position" aria-live="polite">Rotary angle: 0°</small>
                 </div>
               </div>
             </div>

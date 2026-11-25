@@ -29,6 +29,18 @@ class MoonrakerClient:
         """Query the live toolhead position, which /printer/info does not include."""
         return self._request("GET", "/printer/objects/query?toolhead=position")
 
+    def get_manual_stepper_position(self, stepper: str = "rotary") -> MoonrakerResponse:
+        """Query a manual stepper's current position so the rotary direction is known."""
+        return self._request("GET", f"/printer/objects/query?manual_stepper%20{stepper}=position")
+
+    def firmware_restart(self) -> MoonrakerResponse:
+        """Run FIRMWARE_RESTART so a shutdown/lost MCU can reconnect."""
+        return self._request("POST", "/printer/firmware_restart")
+
+    def restart(self) -> MoonrakerResponse:
+        """Run RESTART, which restarts Klipper without resetting the MCUs."""
+        return self._request("POST", "/printer/restart")
+
     def send_gcode(self, script: str) -> MoonrakerResponse:
         return self._request("POST", "/printer/gcode/script", json_body={"script": script})
 

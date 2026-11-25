@@ -175,7 +175,7 @@ class WebTests(unittest.IsolatedAsyncioTestCase):
         index = await self.client.get("/")
         html = await index.text()
         self.assertEqual(index.status, 200)
-        for landmark in ("Home Machine", "Preview Run", "Start Scan", "Rack 6 × 12", "Begin Pickup Steps", "Run Next Step", "Cancel Steps", "Take Picture"):
+        for landmark in ("Home Machine", "Restart Klipper", "Preview Run", "Start Scan", "Rack 6 × 12", "Begin Pickup Steps", "Populate From Camera", "Run Next Step", "Cancel Steps", "Take Picture"):
             self.assertIn(landmark, html)
         self.assertNotIn('id="console-card"', html)
         self.assertIn('id="camera-preview-toggle" type="checkbox"', html)
@@ -539,6 +539,72 @@ class WebTests(unittest.IsolatedAsyncioTestCase):
             "MANUAL_STEPPER STEPPER=rotary MOVE=45.00",
         ])
 
+    async def test_rotary_sweep_alternates_between_travel_limits(self) -> None:
+        moonraker = FakeMoonraker(ready=True)
+        runtime = WorkflowRuntime(self.settings, moonraker=moonraker)
+        await runtime.refresh_machine()
+        moonraker.commands.clear()
+        client = TestClient(TestServer(create_control_app(self.settings, runtime=runtime, initialize_hardware=False)))
+        await client.start_server()
+        try:
+            payloads = []
+            for _ in range(3):
+                response = await client.post("/api/tooling/rotary/sweep", json={})
+                self.assertEqual(response.status, 200)
+                payloads.append(await response.json())
+
+            self.assertEqual(payloads[0]["action"], "tooling.rotary.sweep")
+            self.assertIn("to 180.0°", payloads[0]["message"])
+            self.assertEqual(moonraker.commands, [
+                "MANUAL_STEPPER STEPPER=rotary MOVE=180.00 SPEED=300 SYNC=1",
+                "MANUAL_STEPPER STEPPER=rotary MOVE=-180.00 SPEED=300 SYNC=1",
+                "MANUAL_STEPPER STEPPER=rotary MOVE=180.00 SPEED=300 SYNC=1",
+            ])
+            self.assertEqual((await runtime.snapshot())["machine"]["rotary_angle_deg"], 180.0)
+
+            too_far = await client.post("/api/tooling/rotary/move", json={"degrees": 181})
+            self.assertEqual(too_far.status, 400)
+            too_far_negative = await client.post("/api/tooling/rotary/move", json={"degrees": -181})
+            self.assertEqual(too_far_negative.status, 400)
+            limit = await client.post("/api/tooling/rotary/move", json={"degrees": -180})
+            self.assertEqual(limit.status, 200)
+            self.assertEqual(moonraker.commands[-1], "MANUAL_STEPPER STEPPER=rotary MOVE=-180.00")
+        finally:
+            await client.close()
+
+    async def test_rotary_sweep_uses_live_firmware_position(self) -> None:
+        class RotaryMoonraker(FakeMoonraker):
+            rotary_position = 12.5
+
+            def get_manual_stepper_position(self) -> MoonrakerResponse:
+                return MoonrakerResponse(
+                    True,
+                    200,
+                    payload={
+                        "result": {
+                            "status": {
+                                "manual_stepper rotary": {"position": self.rotary_position}
+                            }
+                        }
+                    },
+                )
+
+        moonraker = RotaryMoonraker(ready=True)
+        runtime = WorkflowRuntime(self.settings, moonraker=moonraker)
+        await runtime.refresh_machine()
+        moonraker.commands.clear()
+
+        await runtime.sweep_rotary()
+        self.assertEqual(moonraker.commands[-1], "MANUAL_STEPPER STEPPER=rotary MOVE=-180.00 SPEED=300 SYNC=1")
+
+        moonraker.rotary_position = -180.0
+        await runtime.sweep_rotary()
+        self.assertEqual(moonraker.commands[-1], "MANUAL_STEPPER STEPPER=rotary MOVE=180.00 SPEED=300 SYNC=1")
+
+        moonraker.rotary_position = 0.0
+        await runtime.sweep_rotary()
+        self.assertEqual(moonraker.commands[-1], "MANUAL_STEPPER STEPPER=rotary MOVE=180.00 SPEED=300 SYNC=1")
+
     async def test_combined_macro_endpoints(self) -> None:
         ready_moonraker = FakeMoonraker(ready=True)
         runtime = WorkflowRuntime(self.settings, moonraker=ready_moonraker)
@@ -798,6 +864,27 @@ class PositionedFakeMoonraker(FakeMoonraker):
         )
 
 
+class RestartableFakeMoonraker(FakeMoonraker):
+    """Moonraker that reports a configurable Klipper state and restarts on demand."""
+
+    def __init__(self, state: str = "shutdown") -> None:
+        super().__init__(ready=True)
+        self.state = state
+        self.restart_calls = 0
+
+    def get_printer_info(self) -> MoonrakerResponse:
+        return MoonrakerResponse(
+            True,
+            200,
+            payload={"result": {"state": self.state, "state_message": f"Printer is {self.state}"}},
+        )
+
+    def firmware_restart(self) -> MoonrakerResponse:
+        self.restart_calls += 1
+        self.state = "ready"
+        return MoonrakerResponse(True, 200)
+
+
 class CircleFakeCameraPreview(FakeCameraPreview):
     """Streaming camera fake that exposes whole-frame cap detections."""
 
@@ -890,6 +977,54 @@ class CapsEndpointTests(unittest.IsolatedAsyncioTestCase):
         # Query parameters let the view work on a bench without Klipper.
         self.assertTrue(override["machine"]["known"])
         self.assertEqual(override["placed_count"], 1)
+
+
+class KlipperRestartTests(unittest.IsolatedAsyncioTestCase):
+    async def _client(self, runtime: WorkflowRuntime) -> TestClient:
+        settings = runtime.settings
+        client = TestClient(TestServer(create_control_app(
+            settings,
+            runtime=runtime,
+            initialize_hardware=False,
+        )))
+        await client.start_server()
+        return client
+
+    async def test_restart_klipper_recovers_a_shutdown_mcu_from_the_dashboard(self) -> None:
+        settings = load_settings(Path(__file__).resolve().parents[1] / "calibration")
+        moonraker = RestartableFakeMoonraker("shutdown")
+        runtime = WorkflowRuntime(settings, moonraker=moonraker)
+        await runtime.refresh_machine()
+        snapshot = await runtime.snapshot()
+        self.assertEqual(snapshot["machine"]["klipper_state"], "shutdown")
+        self.assertFalse(snapshot["capabilities"]["start"])
+        self.assertTrue(snapshot["capabilities"]["restart_klipper"])
+        client = await self._client(runtime)
+        try:
+            response = await client.post("/api/actions/klipper-restart", json={})
+            payload = await response.json()
+            after = await runtime.snapshot()
+        finally:
+            await client.close()
+            await runtime.close()
+        self.assertEqual(response.status, 200)
+        self.assertEqual(payload["action"], "machine.firmware_restart")
+        self.assertEqual(moonraker.restart_calls, 1)
+        self.assertEqual(after["machine"]["klipper_state"], "ready")
+
+    async def test_restart_klipper_is_unavailable_when_moonraker_is_offline(self) -> None:
+        settings = load_settings(Path(__file__).resolve().parents[1] / "calibration")
+        runtime = WorkflowRuntime(settings, moonraker=FakeMoonraker(ready=False))
+        await runtime.refresh_machine()
+        snapshot = await runtime.snapshot()
+        self.assertFalse(snapshot["capabilities"]["restart_klipper"])
+        client = await self._client(runtime)
+        try:
+            response = await client.post("/api/actions/klipper-restart", json={})
+        finally:
+            await client.close()
+            await runtime.close()
+        self.assertEqual(response.status, 503)
 
 
 if __name__ == "__main__":

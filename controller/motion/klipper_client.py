@@ -2,6 +2,11 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
+# The rotary stage may only travel a half turn either side of its zero point.
+ROTARY_MIN_DEG = -180.0
+ROTARY_MAX_DEG = 180.0
+ROTARY_SWEEP_SPEED = 300.0
+
 
 @dataclass(frozen=True)
 class KlipperMotionClient:
@@ -42,6 +47,14 @@ class KlipperMotionClient:
 
     def set_yaw_command(self, angle_deg: float) -> str:
         return f"MANUAL_STEPPER STEPPER=rotary MOVE={angle_deg:.2f}"
+
+    def sweep_rotary_command(self, target_deg: float) -> str:
+        """Slowly move the rotary to ``target_deg``, clamped to the safe travel range."""
+        target = max(ROTARY_MIN_DEG, min(ROTARY_MAX_DEG, float(target_deg)))
+        return (
+            f"MANUAL_STEPPER STEPPER=rotary MOVE={target:.2f} "
+            f"SPEED={ROTARY_SWEEP_SPEED:.0f} SYNC=1"
+        )
 
     def initialize_tooling_command(self) -> str:
         return "SET_PIN PIN=solenoid VALUE=0\nSET_PIN PIN=vacuum_pump VALUE=0"

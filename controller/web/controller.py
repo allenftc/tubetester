@@ -56,6 +56,8 @@ class WorkflowController(MachineActions, CameraPickupActions, WorkflowControlAct
         self._debug_pickup: dict[str, Any] | None = None
         self._debug_pickup_lock = asyncio.Lock()
         self._stereo_test_active = False
+        self._survey_active = False
+        self._survey_lock = asyncio.Lock()
         self._pause_gate = asyncio.Event()
         self._pause_gate.set()
         self._stop_requested = asyncio.Event()
@@ -71,6 +73,7 @@ class WorkflowController(MachineActions, CameraPickupActions, WorkflowControlAct
             "state_message": "Moonraker has not been contacted.",
             "position_mm": None,
             "homed_axes": [],
+            "rotary_angle_deg": 0.0,
         }
         self._workflow = self._empty_workflow()
         self._tubes = self._new_tubes()
@@ -86,7 +89,11 @@ class WorkflowController(MachineActions, CameraPickupActions, WorkflowControlAct
     @property
     def busy(self) -> bool:
         """True while a workflow or camera pickup is using the machine."""
-        return self._workflow["state"] in _ACTIVE_STATES or self.debug_pickup_active
+        return (
+            self._workflow["state"] in _ACTIVE_STATES
+            or self.debug_pickup_active
+            or self._survey_active
+        )
 
     async def apply_settings(self, settings: ControllerSettings) -> None:
         """Swap calibration settings into a running controller.
@@ -121,6 +128,7 @@ class WorkflowController(MachineActions, CameraPickupActions, WorkflowControlAct
                 "yaw_attempt",
                 "decoded_payload",
                 "color",
+                "survey",
                 "confidence",
                 "frame_id",
                 "error",
@@ -271,20 +279,51 @@ class WorkflowController(MachineActions, CameraPickupActions, WorkflowControlAct
         issues = self._readiness_issues(machine)
         active = workflow["state"] in _ACTIVE_STATES
         debug_active = self.debug_pickup_active
+        survey_active = self._survey_active
         ready = not issues
         blocking_issues = [issue for issue in issues if not issue.get("overridable", False)]
         degraded_available = bool(issues) and not blocking_issues
         capabilities = {
-            "home": machine["klipper_state"] == "ready" and workflow["state"] in _TERMINAL_STATES and not debug_active,
+            "home": (
+                machine["klipper_state"] == "ready"
+                and workflow["state"] in _TERMINAL_STATES
+                and not debug_active
+                and not survey_active
+            ),
             "preview": not active,
-            "start": not blocking_issues and not active and not debug_active and bool(tubes),
+            "start": not blocking_issues and not active and not debug_active and not survey_active and bool(tubes),
             "pause": workflow["state"] == "running",
             "resume": workflow["state"] == "paused",
             "stop": workflow["state"] in _ACTIVE_STATES,
-            "send_gcode": machine["klipper_state"] == "ready" and not active and not debug_active,
-            "tooling": machine["klipper_state"] == "ready" and workflow["state"] in _TERMINAL_STATES and not debug_active,
-            "camera_pickup_stepper": machine["klipper_state"] == "ready" and not active,
-            "stereo_test": machine["klipper_state"] == "ready" and not active and not debug_active and not self._stereo_test_active,
+            "send_gcode": machine["klipper_state"] == "ready" and not active and not debug_active and not survey_active,
+            "restart_klipper": (
+                machine["connected"]
+                and workflow["state"] in _TERMINAL_STATES
+                and not debug_active
+                and not self._stereo_test_active
+                and not survey_active
+            ),
+            "survey_tubes": (
+                machine["klipper_state"] == "ready"
+                and workflow["state"] in _TERMINAL_STATES
+                and not debug_active
+                and not self._stereo_test_active
+                and not survey_active
+            ),
+            "tooling": (
+                machine["klipper_state"] == "ready"
+                and workflow["state"] in _TERMINAL_STATES
+                and not debug_active
+                and not survey_active
+            ),
+            "camera_pickup_stepper": machine["klipper_state"] == "ready" and not active and not survey_active,
+            "stereo_test": (
+                machine["klipper_state"] == "ready"
+                and not active
+                and not debug_active
+                and not self._stereo_test_active
+                and not survey_active
+            ),
             "qr": self.qr_backend is not None,
             "degraded_mode": degraded_available,
         }
@@ -313,6 +352,7 @@ class WorkflowController(MachineActions, CameraPickupActions, WorkflowControlAct
                 "pickup_height_mm": self.settings.rack.pickup_height_mm,
                 "scan_height_mm": self.settings.rack.scan_height_mm,
                 "scan_height_with_offset_mm": self.settings.rack.scan_height_with_offset_mm,
+                "survey_height_mm": self.settings.rack.survey_height_mm,
                 "color_heights_mm": dict(self.settings.rack.pickup_height_offset_mm_by_color),
                 "tubes": tubes,
             },
@@ -408,6 +448,8 @@ class WorkflowController(MachineActions, CameraPickupActions, WorkflowControlAct
         phase = self._phase_for(step)
         async with self._lock:
             self._workflow["progress"]["completed_steps"] = index
+            if phase == "scan" and step.yaw_angle_deg is not None:
+                self._machine["rotary_angle_deg"] = float(step.yaw_angle_deg)
             if phase == "pickup":
                 self._held_tube = True
             if phase == "release" and step.row and step.column:
@@ -482,6 +524,7 @@ class WorkflowController(MachineActions, CameraPickupActions, WorkflowControlAct
                     "yaw_attempt_total": len(self.settings.yaw.sweep_angles()),
                     "decoded_payload": None,
                     "color": None,
+                    "survey": None,
                     "confidence": None,
                     "frame_id": None,
                     "error": None,
@@ -512,7 +555,12 @@ class WorkflowController(MachineActions, CameraPickupActions, WorkflowControlAct
         if not machine["connected"]:
             issues.append({"level": "error", "code": "moonraker_offline", "message": "Moonraker is offline.", "overridable": False})
         elif machine["klipper_state"] != "ready":
-            issues.append({"level": "error", "code": "klipper_not_ready", "message": "Klipper is not ready.", "overridable": False})
+            issues.append({
+                "level": "error",
+                "code": "klipper_not_ready",
+                "message": "Klipper is not ready. If the SKR was powered off, turn it back on and press Restart Klipper.",
+                "overridable": False,
+            })
         if self.qr_backend is None:
             issues.append({"level": "warning", "code": "qr_backend_unavailable", "message": "Camera/QR acquisition is unavailable. Degraded mode can record no-decode results without camera work.", "overridable": True})
         return issues
@@ -523,9 +571,34 @@ class WorkflowController(MachineActions, CameraPickupActions, WorkflowControlAct
     def _tube(self, row: int, column: int) -> dict[str, Any]:
         return self._tubes[(row - 1) * self.settings.rack.columns + column - 1]
 
-    async def _record_tube_color(self, row: int, column: int, color: str) -> None:
+    async def _record_tube_cap(self, row: int, column: int, cap: Any) -> None:
+        """Store a matched cap's colour plus its leaned top offset and tilt.
+
+        The offset is the cap top's XY minus the slot centre, so the interface
+        can keep drawing a leaning tube after the camera moves away.
+        """
+        slot = self.settings.rack.tube_position(row - 1, column - 1)
+        offset_x = offset_y = tilt = None
+        if cap.x_mm is not None and cap.y_mm is not None:
+            offset_x = float(cap.x_mm) - slot.x
+            offset_y = float(cap.y_mm) - slot.y
+            height = cap.cap_height_mm
+            if height is not None and math.isfinite(height) and height > 0:
+                tilt = math.degrees(math.atan2(math.hypot(offset_x, offset_y), height))
         async with self._lock:
-            self._tube(row, column)["color"] = color
+            tube = self._tube(row, column)
+            if cap.color is not None:
+                tube["color"] = cap.color
+            tube["survey"] = {
+                "x_mm": None if cap.x_mm is None else float(cap.x_mm),
+                "y_mm": None if cap.y_mm is None else float(cap.y_mm),
+                "offset_x_mm": offset_x,
+                "offset_y_mm": offset_y,
+                "cap_height_mm": None if cap.cap_height_mm is None else float(cap.cap_height_mm),
+                "tilt_deg": tilt,
+                "color": cap.color,
+                "recorded_at": utc_timestamp(),
+            }
 
     def _update_percent_and_summary(self) -> None:
         progress = self._workflow["progress"]

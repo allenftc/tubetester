@@ -60,7 +60,7 @@ For a deeper walkthrough of the calibration, camera correction math, and the ste
 
 The scanner controls its tooling through Moonraker and Klipper. The machine's Klipper configuration must define output pins named `solenoid` and `vacuum_pump`, plus a manual stepper named `rotary`.
 
-When Klipper first reports ready, the controller sets both `solenoid` and `vacuum_pump` to `0`. Pickup or the manual Vacuum On control turns on the pump. Release pulses the solenoid to `1` for 500 ms, returns it to `0`, and turns the pump off. Workflow shutdown also sets both outputs off. Rotary positioning uses `MANUAL_STEPPER STEPPER=rotary MOVE=<degrees>`; configure the stepper's position units and rotation distance to match degrees.
+When Klipper first reports ready, the controller sets both `solenoid` and `vacuum_pump` to `0`. Pickup or the manual Vacuum On control turns on the pump. Release pulses the solenoid to `1` for 500 ms, returns it to `0`, and turns the pump off. Workflow shutdown also sets both outputs off. Rotary positioning uses `MANUAL_STEPPER STEPPER=rotary MOVE=<degrees>`; configure the stepper's position units and rotation distance to match degrees. The rotary is limited to `-180` to `+180` degrees. **Sweep Rotary** reads the current firmware position and slowly moves to the opposite end at `SPEED=300`, alternating direction on each press so repeated sweeps scan the whole tube.
 
 The manual tooling controls use these same Klipper commands, including zeroing the current rotary position. When QR decoding is unavailable, degraded scans still perform physical pickup and release but skip QR and rotary scan steps. A failed Klipper command stops the remaining workflow steps.
 

@@ -5,6 +5,11 @@ import math
 import uuid
 from typing import Any
 
+from controller.motion.klipper_client import (
+    ROTARY_MAX_DEG,
+    ROTARY_MIN_DEG,
+    ROTARY_SWEEP_SPEED,
+)
 from controller.network.moonraker import MoonrakerResponse
 from controller.vision.camera_preview import CameraPreviewService
 from controller.vision.tubeLocator.cap_matching import LocatedCap, assign_caps_to_slots, locate_caps, select_cap
@@ -30,6 +35,49 @@ class MachineActions:
             raise RuntimeUnavailable("Klipper must be ready and the workflow inactive to send G-code.")
         return await self._send_action("gcode.send", script, source="user")
 
+    async def restart_klipper(self) -> dict[str, Any]:
+        """Run FIRMWARE_RESTART through Moonraker to recover a stopped/lost MCU."""
+        snapshot = await self.snapshot()
+        if not snapshot["capabilities"]["restart_klipper"]:
+            raise RuntimeUnavailable(
+                "Moonraker must be reachable and the machine idle before Klipper can be restarted."
+            )
+        correlation_id = f"req_{uuid.uuid4().hex}"
+        self.events.publish(
+            "Requesting Klipper firmware restart.",
+            source="user",
+            correlation_id=correlation_id,
+        )
+        try:
+            response = await asyncio.to_thread(self.moonraker.firmware_restart)
+        except Exception as exc:
+            response = MoonrakerResponse(False, 0, error_message=str(exc))
+        if not response.ok:
+            message = response.error_message or "Moonraker rejected the firmware restart."
+            self.events.publish(message, source="moonraker", level="error", correlation_id=correlation_id)
+            raise RuntimeUnavailable(message)
+        async with self._lock:
+            # Force the tooling initialization to run again once Klipper is ready.
+            self._hardware_initialized = False
+            # A firmware restart resets the manual stepper's tracked position.
+            self._machine["rotary_angle_deg"] = 0.0
+        self.events.publish("Firmware restart accepted by Moonraker.", source="moonraker", correlation_id=correlation_id)
+        # Briefly wait for the state transition so the dashboard sees the result.
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + 5.0
+        while True:
+            await asyncio.sleep(0.5)
+            await self.refresh_machine()
+            if self._machine["klipper_state"] == "ready" or loop.time() >= deadline:
+                break
+        state = self._machine["klipper_state"]
+        message = (
+            "Klipper is ready again. Re-home the axes before moving."
+            if state == "ready"
+            else f"Firmware restart requested; Klipper is currently {state}."
+        )
+        return self._action("machine.firmware_restart", message)
+
     async def release_tube(self) -> dict[str, Any]:
         return await self._send_action("tooling.release", self.motion.release_command(), source="klipper")
 
@@ -40,19 +88,85 @@ class MachineActions:
         return await self._send_action("tooling.vacuum_off", self.motion.vacuum_off_command(), source="klipper")
 
     async def zero_rotary(self) -> dict[str, Any]:
-        return await self._send_action("tooling.rotary.zero", self.motion.set_rotary_position_command(), source="klipper")
+        result = await self._send_action(
+            "tooling.rotary.zero",
+            self.motion.set_rotary_position_command(),
+            source="klipper",
+        )
+        self._remember_rotary_angle(0.0)
+        self._broadcast_status()
+        return result
 
     async def rotate_to_position(self, degrees: int) -> dict[str, Any]:
         if isinstance(degrees, bool) or not isinstance(degrees, int):
             raise ValueError("degrees must be an integer")
-        return await self._send_action(
+        if not ROTARY_MIN_DEG <= degrees <= ROTARY_MAX_DEG:
+            raise ValueError(
+                f"degrees must be between {ROTARY_MIN_DEG:.0f} and {ROTARY_MAX_DEG:.0f}"
+            )
+        result = await self._send_action(
             "tooling.rotary.move",
             self.motion.set_yaw_command(degrees),
             source="klipper",
         )
+        self._remember_rotary_angle(float(degrees))
+        self._broadcast_status()
+        return result
+
+    async def sweep_rotary(self) -> dict[str, Any]:
+        """Slowly sweep the rotary to the opposite end of its travel.
+
+        The direction follows the current firmware position (falling back to the
+        last commanded angle), so repeated presses alternate between -180 and
+        +180 while the rotary always stays inside that range.
+        """
+        snapshot = await self.snapshot()
+        if not snapshot["capabilities"]["tooling"]:
+            raise RuntimeUnavailable(
+                "Klipper must be ready and the workflow inactive before sweeping the rotary."
+            )
+        current = await self._query_rotary_angle()
+        if current is None:
+            current = float(self._machine.get("rotary_angle_deg", 0.0))
+        current = max(ROTARY_MIN_DEG, min(ROTARY_MAX_DEG, current))
+        target = ROTARY_MIN_DEG if current > 0 else ROTARY_MAX_DEG
+        result = await self._send_action(
+            "tooling.rotary.sweep",
+            self.motion.sweep_rotary_command(target),
+            source="klipper",
+        )
+        self._remember_rotary_angle(target)
+        self._broadcast_status()
+        result["message"] = (
+            f"Rotary sweeping from {current:.1f}° to {target:.1f}° "
+            f"at speed {ROTARY_SWEEP_SPEED:.0f}."
+        )
+        return result
+
+    async def _query_rotary_angle(self) -> float | None:
+        """Read the live rotary position when Moonraker supports it."""
+        getter = getattr(self.moonraker, "get_manual_stepper_position", None)
+        if getter is None:
+            return None
+        try:
+            response = await asyncio.to_thread(getter)
+        except Exception:
+            return None
+        if not response.ok:
+            return None
+        result = (response.payload or {}).get("result", response.payload or {})
+        stepper = (result.get("status") or {}).get("manual_stepper rotary") or {}
+        try:
+            angle = float(stepper.get("position"))
+        except (TypeError, ValueError):
+            return None
+        return angle if math.isfinite(angle) else None
+
+    def _remember_rotary_angle(self, angle: float) -> None:
+        self._machine["rotary_angle_deg"] = float(angle)
 
     async def calibrate_rotary_macro(self) -> dict[str, Any]:
-        return await self._run_manual_macro(
+        result = await self._run_manual_macro(
             "macro.calibrate",
             "Calibration macro completed.",
             (
@@ -65,6 +179,9 @@ class MachineActions:
                 ("gcode", self.motion.synchronized_move_command(z=100, feedrate=15000)),
             ),
         )
+        self._remember_rotary_angle(0.0)
+        self._broadcast_status()
+        return result
 
     async def pickup_macro(self) -> dict[str, Any]:
         return await self._run_manual_macro(
@@ -348,6 +465,128 @@ class CameraPickupActions:
             self._broadcast_status()
             return self._debug_pickup_payload()
 
+    async def survey_tubes(
+        self,
+        row: int,
+        column: int,
+        camera_preview: CameraPreviewService,
+    ) -> dict[str, Any]:
+        """Move high above ``row``/``column`` and populate every cap the camera can see.
+
+        The camera is raised to ``survey_height_mm`` (well above the normal scan
+        height), moved over the selected slot, and every detected cap is placed
+        in rack space and matched one-to-one to a slot. Matched slots get their
+        cap colour recorded, which is what fills them in in the rack selector.
+        """
+        if isinstance(row, bool) or not isinstance(row, int) or not 1 <= row <= self.settings.rack.rows:
+            raise ValueError("row is outside rack bounds")
+        if isinstance(column, bool) or not isinstance(column, int) or not 1 <= column <= self.settings.rack.columns:
+            raise ValueError("column is outside rack bounds")
+
+        async with self._survey_lock:
+            snapshot = await self.snapshot()
+            if not snapshot["capabilities"]["survey_tubes"]:
+                raise RuntimeUnavailable(
+                    "Klipper must be ready and the workflow idle before surveying the rack."
+                )
+            self._survey_active = True
+            self._broadcast_status()
+            correlation_id = f"req_{uuid.uuid4().hex}"
+            camera_started = False
+            original_mode = "hsv"
+            try:
+                tube = self.settings.rack.tube_position(row - 1, column - 1)
+                offset = self.settings.rack.camera_offset_mm
+                camera_x = tube.x - offset.x
+                camera_y = tube.y - offset.y
+                survey_z = self.settings.rack.survey_height_mm
+                if not math.isfinite(survey_z):
+                    raise RuntimeUnavailable("rack.json survey_height_mm must be finite.")
+
+                camera_status = camera_preview.status()
+                camera_started = camera_status["state"] in {"not_started", "stopped"}
+                original_mode = camera_status.get("detection_mode", "hsv")
+                camera_preview.set_detection_mode("hough")
+                if camera_started:
+                    await asyncio.to_thread(camera_preview.start)
+
+                self.events.publish(
+                    f"Surveying from R{row} C{column} at Z={survey_z:.2f} mm.",
+                    source="camera",
+                    correlation_id=correlation_id,
+                )
+                # Climb straight up first, then travel at survey height.
+                command = "\n".join((
+                    self.motion.synchronized_move_command(z=survey_z, feedrate=10000),
+                    self.motion.synchronized_move_command(x=camera_x, y=camera_y, feedrate=10000),
+                ))
+                await self._send_macro_gcode(command, correlation_id)
+
+                sequence = camera_preview.status()["sequence"]
+                result = await asyncio.to_thread(
+                    camera_preview.wait_for_circle_detections,
+                    sequence,
+                    10,
+                    8.0,
+                )
+                if result is None:
+                    raise RuntimeUnavailable("The camera did not provide a fresh survey frame.")
+                caps = locate_caps(
+                    result["circles"],
+                    (camera_x, camera_y),
+                    survey_z,
+                    self.settings.rack.cap_height_for_color,
+                )
+                slots = {
+                    (slot_row, slot_column): (position.x, position.y)
+                    for slot_row in range(self.settings.rack.rows)
+                    for slot_column in range(self.settings.rack.columns)
+                    for position in (self.settings.rack.tube_position(slot_row, slot_column),)
+                }
+                assigned = assign_caps_to_slots(
+                    caps,
+                    slots,
+                    self.settings.rack.slot_tolerance_mm,
+                )
+                populated: list[dict[str, Any]] = []
+                for (slot_row, slot_column), cap in assigned.items():
+                    if cap.color is None:
+                        continue
+                    await self._record_tube_cap(slot_row + 1, slot_column + 1, cap)
+                    populated.append({
+                        "row": slot_row + 1,
+                        "column": slot_column + 1,
+                        "color": cap.color,
+                        "x_mm": cap.x_mm,
+                        "y_mm": cap.y_mm,
+                        "cap_height_mm": cap.cap_height_mm,
+                    })
+                message = (
+                    f"Survey from R{row} C{column} identified {len(populated)} tube(s) "
+                    f"from {len(caps)} cap(s) in view."
+                )
+                self.events.publish(message, source="camera", correlation_id=correlation_id)
+                return {
+                    "ok": True,
+                    "action": "camera.survey",
+                    "row": row,
+                    "column": column,
+                    "camera_xy": {"x": camera_x, "y": camera_y},
+                    "survey_z_mm": survey_z,
+                    "caps_seen": len(caps),
+                    "tubes_populated": populated,
+                    "message": message,
+                }
+            finally:
+                try:
+                    if camera_started:
+                        await asyncio.to_thread(camera_preview.stop)
+                    else:
+                        camera_preview.set_detection_mode(original_mode)
+                finally:
+                    self._survey_active = False
+                    self._broadcast_status()
+
     async def run_camera_pickup_step(self, session_id: str, camera_preview: CameraPreviewService) -> dict[str, Any]:
         async with self._debug_pickup_lock:
             session = self._require_debug_pickup(session_id)
@@ -374,7 +613,7 @@ class CameraPickupActions:
                     session["detected_color"] = color
                     session["matched_cap"] = match.as_dict()
                     session["survey_xy"] = {"x": match.x_mm, "y": match.y_mm}
-                    await self._record_tube_color(session["row"], session["column"], color)
+                    await self._record_tube_cap(session["row"], session["column"], match)
                     session["calibrated_scan_height_mm"] = (
                         self.settings.rack.calibrated_scan_height_for_color(color)
                     )
@@ -415,6 +654,7 @@ class CameraPickupActions:
                     )
                     session["detected_center_px"] = list(match.pixel)
                     session["matched_cap"] = match.as_dict()
+                    await self._record_tube_cap(session["row"], session["column"], match)
                     target_x, target_y = match.x_mm, match.y_mm
                     offset_x = target_x - session["tube_xy"]["x"]
                     offset_y = target_y - session["tube_xy"]["y"]

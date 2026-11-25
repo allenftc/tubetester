@@ -281,6 +281,8 @@ function renderSnapshot(snapshot) {
   setChip("controller-chip", `● Controller ${title(workflow.state)}`, workflow.state);
   const p = machine.position_mm;
   setChip("position-chip", p ? `Position X ${number(p.x)} Y ${number(p.y)} Z ${number(p.z)}` : "Position Unknown", "neutral");
+  const rotary = Number(machine.rotary_angle_deg);
+  setText("rotary-position", `Rotary angle: ${Number.isFinite(rotary) ? number(rotary) : "?"}°`);
   setChip("workflow-chip", workflow.state.toUpperCase(), workflow.state);
   setChip("qr-chip", snapshot.capabilities.qr ? "QR READY" : "QR UNAVAILABLE", snapshot.capabilities.qr ? "ready" : "warning");
   setChip("tooling-chip", snapshot.capabilities.tooling ? "TOOLING READY" : "TOOLING UNAVAILABLE", snapshot.capabilities.tooling ? "ready" : "error");
@@ -312,18 +314,20 @@ function setReadiness(messages) {
 }
 function setCapabilities(caps, workflowState) {
   ["home", "preview", "start", "stop"].forEach(name => { el(`${name}-button`).disabled = !caps[name]; });
+  el("restart-klipper-button").disabled = !caps.restart_klipper;
   const pause = el("pause-button");
   const resume = workflowState === "paused";
   pause.textContent = resume ? "Resume" : "Pause";
   pause.title = resume ? "Continue the paused scan." : "Pause after the active Moonraker command finishes.";
   setText("pause-description", resume ? "Continue scan" : "Hold safely");
   pause.disabled = resume ? !caps.resume : !caps.pause;
-  ["tooling-release-button", "tooling-vacuum-button", "tooling-vacuum-off-button", "tooling-zero-button", "rotary-degrees-input"].forEach(id => { el(id).disabled = !caps.tooling; });
-  el("rotary-move-button").disabled = !caps.tooling || !isWholeNumber(el("rotary-degrees-input").value);
+  ["tooling-release-button", "tooling-vacuum-button", "tooling-vacuum-off-button", "tooling-zero-button", "tooling-rotary-sweep-button", "rotary-degrees-input"].forEach(id => { el(id).disabled = !caps.tooling; });
+  el("rotary-move-button").disabled = !caps.tooling || !isRotaryAngle(el("rotary-degrees-input").value);
   const pickupRunning = state.cameraPickupSession?.state === "running";
   const pickupFailed = state.cameraPickupSession?.state === "failed";
   const pickupLocked = pickupRunning || pickupFailed;
   el("stereo-test-button").disabled = !caps.stereo_test || !state.selectedTube || state.cameraLocateBusy || state.stereoTestBusy || pickupLocked;
+  el("survey-selected-tube-button").disabled = !caps.survey_tubes || !state.selectedTube || state.cameraLocateBusy || state.stereoTestBusy || pickupLocked;
   el("stereo-test-button").textContent = state.stereoTestBusy ? "Testing Stereo…" : "Test Stereo Position";
   el("locate-selected-tube-button").disabled = !caps.send_gcode || !state.selectedTube || state.cameraLocateBusy || state.stereoTestBusy || pickupRunning;
   el("run-next-pickup-step-button").hidden = !pickupRunning;
@@ -608,6 +612,11 @@ function showTubeDetails(tube) {
     const heightMm = state.snapshot?.rack?.color_heights_mm?.[tube.color];
     details.push(`cap ${tube.color}${Number.isFinite(Number(heightMm)) ? ` · ${number(heightMm)} mm` : ""}`);
   }
+  const survey = tube.survey;
+  if (survey && survey.tilt_deg != null && survey.offset_x_mm != null && survey.offset_y_mm != null) {
+    const signed = value => `${Number(value) >= 0 ? "+" : ""}${number(value)}`;
+    details.push(`saved lean ${number(survey.tilt_deg)}° · offset X ${signed(survey.offset_x_mm)} Y ${signed(survey.offset_y_mm)} mm`);
+  }
   if (tube.decoded_payload) details.push(`payload: ${tube.decoded_payload}`);
   if (tube.confidence != null) details.push(`confidence ${number(tube.confidence)}`);
   if (tube.error) details.push(`error: ${tube.error}`);
@@ -757,6 +766,7 @@ function drawCaps3d() {
   caps3dDrawRack(ctx, view, scene);
   const tubes = [];
   for (const tube of scene.nominal) tubes.push({...tube, ghost: true});
+  for (const tube of scene.stored) tubes.push(tube);
   for (const tube of scene.detected) tubes.push(tube);
   tubes.sort((a, b) => caps3dDistance2(view.eye, b) - caps3dDistance2(view.eye, a));
   for (const tube of tubes) caps3dDrawTube(ctx, view, tube);
@@ -839,17 +849,52 @@ function buildCapsScene(data) {
     });
   }
 
+  const liveSlots = new Set();
+  for (const tube of detected) {
+    if (tube.slot) liveSlots.add(`${tube.slot.row}:${tube.slot.column}`);
+  }
+
+  const stored = [];
   const nominal = [];
   for (const tube of snapshotTubes) {
-    if (!tube.color) continue;
-    const height = heightFor(tube.color);
-    nominal.push({
+    const survey = tube.survey;
+    const hasSurvey = Boolean(
+      survey
+      && survey.x_mm != null
+      && survey.y_mm != null
+      && Number.isFinite(Number(survey.x_mm))
+      && Number.isFinite(Number(survey.y_mm))
+    );
+    const color = tube.color || (survey && survey.color) || null;
+    if (!color) continue;
+    if (liveSlots.has(`${tube.row}:${tube.column}`)) continue;
+    const height = hasSurvey && survey.cap_height_mm != null && Number.isFinite(Number(survey.cap_height_mm))
+      ? Number(survey.cap_height_mm)
+      : heightFor(color);
+    const entry = {
       base: {x: tube.position_mm.x, y: tube.position_mm.y, z: 0},
-      top: {x: tube.position_mm.x, y: tube.position_mm.y, z: height},
+      top: {
+        x: hasSurvey ? Number(survey.x_mm) : tube.position_mm.x,
+        y: hasSurvey ? Number(survey.y_mm) : tube.position_mm.y,
+        z: height,
+      },
       height,
-      color: tube.color,
+      color,
       radius,
-    });
+    };
+    if (hasSurvey) {
+      entry.stored = true;
+      entry.tiltDeg = survey.tilt_deg != null && Number.isFinite(Number(survey.tilt_deg)) ? Number(survey.tilt_deg) : null;
+      entry.slot = {
+        x: tube.position_mm.x,
+        y: tube.position_mm.y,
+        row: tube.row,
+        column: tube.column,
+      };
+      stored.push(entry);
+    } else {
+      nominal.push(entry);
+    }
   }
 
   const spanX = Math.abs(pitch.x) * Math.max(1, columns);
@@ -867,6 +912,7 @@ function buildCapsScene(data) {
       z: 14,
     },
     detected,
+    stored,
     nominal,
     camera: data?.camera || null,
   };
@@ -876,21 +922,26 @@ function updateCaps3dChrome(scene, data) {
   const caps = data?.caps || [];
   const placed = data?.placed_count || 0;
   const live = Boolean(data && data.available);
-  if (!live) {
+  const stored = scene?.stored?.length || 0;
+  if (!live && stored > 0) {
+    setChip("caps3d-chip", `3D · ${stored} SAVED`, "ready");
+  } else if (!live) {
     setChip("caps3d-chip", "CAMERA OFF", "neutral");
   } else if (placed > 0) {
     setChip("caps3d-chip", `3D · ${caps.length} CAP${caps.length === 1 ? "" : "S"}`, "ready");
   } else if (caps.length > 0) {
     setChip("caps3d-chip", `3D · ${caps.length} UNPLACED`, "warning");
+  } else if (stored > 0) {
+    setChip("caps3d-chip", `3D · ${stored} SAVED`, "ready");
   } else {
     setChip("caps3d-chip", "3D · NO CAPS", "warning");
   }
 
   let message = "";
-  if (!live) message = "Turn on the camera preview to place detected caps in 3D.";
-  else if (data && !data.machine?.known) message = "Gantry position is unknown, so caps cannot be placed yet. Home the machine and keep Klipper connected.";
-  else if (caps.length === 0) message = "No caps are visible in the current frame.";
-  else if (placed === 0) message = `${caps.length} cap(s) seen, but none has a known colour, so no height can be derived.`;
+  if (!live && stored === 0) message = "Turn on the camera preview to place detected caps in 3D.";
+  else if (live && data && !data.machine?.known && placed === 0 && stored === 0) message = "Gantry position is unknown, so caps cannot be placed yet. Home the machine and keep Klipper connected.";
+  else if (live && caps.length === 0 && stored === 0) message = "No caps are visible in the current frame.";
+  else if (live && placed === 0 && caps.length > 0 && stored === 0) message = `${caps.length} cap(s) seen, but none has a known colour, so no height can be derived.`;
   const empty = el("caps3d-empty");
   empty.hidden = !message;
   empty.textContent = message;
@@ -901,10 +952,12 @@ function updateCaps3dChrome(scene, data) {
     const height = data.camera.height_mm + data.camera.raise_mm;
     parts.push(`camera ${number(height)} mm above rack · tilt ${number(data.camera.tilt_deg)}°`);
   }
-  if (data) parts.push(`${placed} of ${caps.length} caps placed`);
+  if (live) parts.push(`${placed} of ${caps.length} live cap(s) placed`);
+  if (stored) parts.push(`${stored} saved from the last survey`);
   if (data?.unplaced_count) parts.push(`${data.unplaced_count} without a colour height`);
-  if (scene?.detected?.length) {
-    const maxTilt = scene.detected.reduce((max, tube) => Math.max(max, caps3dTiltDeg(tube)), 0);
+  const leaning = [...(scene?.detected || []), ...(scene?.stored || [])];
+  if (leaning.length) {
+    const maxTilt = leaning.reduce((max, tube) => Math.max(max, caps3dTiltDeg(tube)), 0);
     if (maxTilt >= 1) parts.push(`max lean ${number(maxTilt)}°`);
   }
   setText("caps3d-details", parts.length ? `${parts.join(" · ")}. Drag to orbit, scroll to zoom.` : "Drag to orbit, scroll to zoom.");
@@ -912,10 +965,9 @@ function updateCaps3dChrome(scene, data) {
   const legend = el("caps3d-legend");
   legend.replaceChildren();
   const colors = new Map();
-  for (const cap of caps) {
-    if (!cap.placed) continue;
-    const key = cap.color || "unknown";
-    if (!colors.has(key)) colors.set(key, cap.cap_height_mm);
+  for (const tube of leaning) {
+    if (!tube.color) continue;
+    if (!colors.has(tube.color)) colors.set(tube.color, tube.height);
   }
   for (const [color, height] of colors) {
     const item = document.createElement("span");
@@ -1025,7 +1077,7 @@ function caps3dDrawTube(ctx, view, tube) {
   if (base.some(point => !point) || top.some(point => !point)) return;
 
   const color = capColor(tube.color);
-  const alpha = tube.ghost ? 0.22 : 0.97;
+  const alpha = tube.ghost ? 0.22 : tube.stored ? 0.72 : 0.97;
 
   if (!tube.ghost) {
     const shadow = caps3dRingPoints({x: tube.base.x, y: tube.base.y}, tube.radius * 1.4, 0, segments)
@@ -1059,7 +1111,11 @@ function caps3dDrawTube(ctx, view, tube) {
   caps3dPoly(
     ctx,
     top,
-    tube.ghost ? caps3dRgba(color, 0.25) : caps3dTint(color, 0.14),
+    tube.ghost
+      ? caps3dRgba(color, 0.25)
+      : tube.stored
+        ? caps3dRgba(color, 0.72)
+        : caps3dTint(color, 0.14),
     tube.focus ? "rgba(255, 255, 255, .95)" : caps3dRgba(color, tube.ghost ? 0.4 : 0.9),
     tube.focus ? 2 : 1,
   );
@@ -1197,9 +1253,11 @@ function caps3dShade(hex, factor, alpha) {
 
 function wireControls() {
   el("home-button").addEventListener("click", () => act("/api/actions/home"));
+  el("restart-klipper-button").addEventListener("click", restartKlipper);
   el("preview-button").addEventListener("click", preview);
   el("locate-selected-tube-button").addEventListener("click", beginCameraPickup);
   el("stereo-test-button").addEventListener("click", runStereoTest);
+  el("survey-selected-tube-button").addEventListener("click", surveySelectedTube);
   el("run-next-pickup-step-button").addEventListener("click", runNextCameraPickupStep);
   el("cancel-pickup-steps-button").addEventListener("click", cancelCameraPickup);
   el("start-button").addEventListener("click", async () => {
@@ -1213,15 +1271,58 @@ function wireControls() {
   el("tooling-vacuum-button").addEventListener("click", () => act("/api/tooling/vacuum"));
   el("tooling-vacuum-off-button").addEventListener("click", () => act("/api/tooling/vacuum/off"));
   el("tooling-zero-button").addEventListener("click", () => act("/api/tooling/rotary/zero"));
+  el("tooling-rotary-sweep-button").addEventListener("click", sweepRotary);
   el("rotary-move-button").addEventListener("click", sendRotaryMove);
-  el("rotary-degrees-input").addEventListener("input", event => { el("rotary-move-button").disabled = event.target.disabled || !isWholeNumber(event.target.value); });
+  el("rotary-degrees-input").addEventListener("input", event => { el("rotary-move-button").disabled = event.target.disabled || !isRotaryAngle(event.target.value); });
 }
 async function act(path, body = {}) { try { const result = await api(path, body); announce(result.message); } catch (error) { announce(error.message); alert(error.message); } }
+async function restartKlipper() {
+  const button = el("restart-klipper-button");
+  const ready = state.snapshot?.machine?.klipper_state === "ready";
+  if (ready && !confirm("Klipper is already ready. Restart it anyway? This resets the MCUs and clears homing.")) return;
+  button.disabled = true;
+  const label = button.textContent;
+  button.textContent = "Restarting…";
+  setText("readiness", ready ? "Restarting Klipper…" : "Waiting for Klipper to start…");
+  announce("Running FIRMWARE_RESTART through Moonraker.");
+  try {
+    const result = await api("/api/actions/klipper-restart");
+    announce(result.message);
+    const response = await fetch("/api/status", {cache: "no-store"});
+    renderSnapshot(await response.json());
+  } catch (error) {
+    announce(error.message);
+    alert(error.message);
+  } finally {
+    button.textContent = label;
+    button.disabled = !state.snapshot?.capabilities?.restart_klipper;
+  }
+}
 async function preview() { try { const result = await api("/api/actions/preview"); const panel = el("preview-result"); panel.hidden = false; panel.textContent = `${result.plan.tube_count} tubes · ${result.plan.step_count} motion steps · ${result.plan.yaw_angles_deg.length} yaw angles. ${result.validation.valid ? "Validation passed." : result.validation.issues.map(issue => issue.message).join(" ")}`; } catch (error) { alert(error.message); } }
 function isWholeNumber(value) { return /^-?\d+$/.test(String(value).trim()); }
+function isRotaryAngle(value) { return isWholeNumber(value) && Number(value) >= -180 && Number(value) <= 180; }
+async function sweepRotary() {
+  const button = el("tooling-rotary-sweep-button");
+  const label = button.textContent;
+  button.disabled = true;
+  button.textContent = "Sweeping…";
+  announce("Sweeping the rotary slowly to the opposite end of its -180° to 180° range.");
+  try {
+    const result = await api("/api/tooling/rotary/sweep");
+    announce(result.message);
+    const response = await fetch("/api/status", {cache: "no-store"});
+    renderSnapshot(await response.json());
+  } catch (error) {
+    announce(error.message);
+    alert(error.message);
+  } finally {
+    button.textContent = label;
+    if (state.snapshot) setCapabilities(state.snapshot.capabilities, state.snapshot.workflow.state);
+  }
+}
 async function sendRotaryMove() {
   const input = el("rotary-degrees-input");
-  if (!isWholeNumber(input.value)) return;
+  if (!isRotaryAngle(input.value)) return;
   try {
     const result = await api("/api/tooling/rotary/move", {degrees: Number(input.value)});
     announce(result.message);
@@ -1269,6 +1370,32 @@ async function runStereoTest() {
     alert(error.message);
   } finally {
     state.stereoTestBusy = false;
+    if (state.snapshot) setCapabilities(state.snapshot.capabilities, state.snapshot.workflow.state);
+  }
+}
+
+async function surveySelectedTube() {
+  if (!state.selectedTube || state.cameraLocateBusy) return;
+  const [row, column] = state.selectedTube.split(":").map(Number);
+  const button = el("survey-selected-tube-button");
+  state.cameraLocateBusy = true;
+  if (state.snapshot) setCapabilities(state.snapshot.capabilities, state.snapshot.workflow.state);
+  button.textContent = "Surveying…";
+  setText("locate-tube-status", `Raising the camera above R${row} C${column} to populate the tubes it can see…`);
+  announce(`Surveying visible tubes from R${row} C${column}.`);
+  try {
+    const result = await api("/api/actions/survey-tubes", {row, column});
+    setText("locate-tube-status", result.message);
+    announce(result.message);
+    const response = await fetch("/api/status", {cache: "no-store"});
+    renderSnapshot(await response.json());
+  } catch (error) {
+    setText("locate-tube-status", error.message);
+    announce(error.message);
+    alert(error.message);
+  } finally {
+    state.cameraLocateBusy = false;
+    button.textContent = "Populate From Camera";
     if (state.snapshot) setCapabilities(state.snapshot.capabilities, state.snapshot.workflow.state);
   }
 }

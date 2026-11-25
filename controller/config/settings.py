@@ -37,6 +37,7 @@ class RackSettings:
     scan_height_mm: float
     scan_height_with_offset_mm: float
     post_pickup_height_mm: float
+    survey_height_mm: float
     pickup_height_offset_mm_by_color: Mapping[str, float]
     columns: int = 1
     rows: int = 1
@@ -159,6 +160,10 @@ def load_settings(config_dir: Path) -> ControllerSettings:
         str(color): float(height)
         for color, height in configured_offsets.items()
     }
+    post_pickup_height_mm = float(rack_data.get(
+        "post_pickup_height_mm",
+        rack_data.get("scan_height_mm", rack_data["safe_z_mm"]),
+    ))
     rack = RackSettings(
         origin_mm=_point3d(rack_data["origin_mm"]),
         tube_pitch_mm=_point2d(rack_data["tube_pitch_mm"]),
@@ -172,10 +177,8 @@ def load_settings(config_dir: Path) -> ControllerSettings:
             "scan_height_with_offset",
             rack_data.get("scan_height_mm", rack_data["safe_z_mm"]),
         )),
-        post_pickup_height_mm=float(rack_data.get(
-            "post_pickup_height_mm",
-            rack_data.get("scan_height_mm", rack_data["safe_z_mm"]),
-        )),
+        post_pickup_height_mm=post_pickup_height_mm,
+        survey_height_mm=float(rack_data.get("survey_height_mm", post_pickup_height_mm)),
         pickup_height_offset_mm_by_color=pickup_height_offset_mm_by_color,
         columns=int(rack_data.get("columns", 1)),
         rows=int(rack_data.get("rows", 1)),

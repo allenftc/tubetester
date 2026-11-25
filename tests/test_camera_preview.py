@@ -351,6 +351,10 @@ class ColorClassificationTests(unittest.TestCase):
             with self.subTest(color=name):
                 self.assertEqual(self._classify(self._scene(hsv)), name)
 
+    def test_ivory_cap_with_a_warm_hue_still_reads_as_white(self) -> None:
+        # The real pale caps average around 30-50 deg hue, not the pure-white 0 deg.
+        self.assertEqual(self._classify(self._scene((20, 20, 220))), "white")
+
     def test_red_cap_on_the_far_side_of_the_hue_wrap_reads_as_red(self) -> None:
         # OpenCV hue wraps at 180, so red spans 170-180 and 0-10.
         self.assertEqual(self._classify(self._scene((175, 150, 200))), "red")

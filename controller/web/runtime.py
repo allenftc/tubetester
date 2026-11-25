@@ -92,6 +92,9 @@ class WorkflowRuntime:
     async def rotate_to_position(self, degrees: int) -> dict[str, Any]:
         return await self._controller.rotate_to_position(degrees)
 
+    async def sweep_rotary(self) -> dict[str, Any]:
+        return await self._controller.sweep_rotary()
+
     async def begin_camera_pickup(
         self,
         row: int,
